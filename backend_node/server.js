@@ -416,38 +416,68 @@ const getLatestTrends = async () => {
 // YOUTUBE VIDEOS (Multi-Source Scraping)
 // ═══════════════════════════════════════════════════════════════
 const YOUTUBE_BASE_QUERIES = [
-    // AI & ML
-    "artificial intelligence news today",
-    "machine learning tutorial 2026",
-    "large language model LLM news",
-    "generative AI latest developments",
-    // Software Engineering
-    "software engineering trends 2026",
-    "coding tutorial react python",
-    "system design interview",
-    "devops kubernetes docker",
-    // Startups & Business
-    "tech startup funding news",
-    "venture capital silicon valley",
-    "Y Combinator startup demo",
-    // Cybersecurity
-    "cybersecurity news hacking",
-    "ethical hacking tutorial",
-    // Cloud & Infrastructure
-    "cloud computing AWS Azure GCP",
-    "serverless computing edge",
-    // Robotics & Hardware
-    "robotics AI automation",
-    "quantum computing breakthrough",
-    // Data & Analytics
-    "data science analytics",
-    "big data pipeline engineering",
-    // Blockchain & Web3
-    "blockchain cryptocurrency news",
-    "web3 decentralized apps",
-    // Research & Science
-    "computer science research paper",
-    "tech conference keynote",
+    // AI & MACHINE LEARNING (The Heart)
+    "artificial intelligence news today", "machine learning tutorial 2026", "large language model LLM news",
+    "generative AI latest developments", "OpenAI GPT-5 leaks and rumors", "Google DeepMind Gemini news",
+    "Anthropic Claude AI updates", "Mistral AI open source news", "NVIDIA AI Blackwell GPU latest",
+    "AI agents autonomous workflows", "Llama 3.1 405B benchmarks", "AI hardware startups 2026",
+    "stable diffusion 3 generation", "AI for software engineering", "vector databases pinecone weaviate",
+    "langchain langgraph tutorials", "pytorch vs tensorflow 2026", "computer vision breakthroughs",
+    "natural language processing 2026", "reinforcement learning robotics",
+
+    // SOFTWARE ENGINEERING & WEB DEV (The Foundation)
+    "software engineering trends 2026", "coding tutorial react python", "system design interview questions",
+    "next.js 15 app router tutorial", "typescript advanced patterns", "rust programming for beginners",
+    "go language backend microservices", "flutter vs react native 2026", "tailwindcss best practices",
+    "web assembly wasm performance", "bun vs nodejs vs deno", "postgresql scaling strategies",
+    "redis insight and caching", "graphql vs restful apis", "testing library vitest tutorial",
+    "playwright end to end testing", "clean code architecture tips", "solid principles in javascript",
+    "functional programming concepts", "software developer roadmap 2026",
+
+    // CLOUD & DEVOPS (The Scale)
+    "devops kubernetes docker tutorial", "AWS lambda serverless news", "google cloud platform gcp 2026",
+    "azure infrastructure as code", "terraform vs opentofu", "ansible automation guide",
+    "prometheus and grafana monitoring", "ci/cd pipeline github actions", "jenkins automation server",
+    "cloud native computing foundation", "edge computing 5g future", "serverless database neon planetscale",
+    "observability with opentelemetry", "site reliability engineering sre", "platform engineering vs devops",
+    "kubernetes k8s troubleshooting", "docker swarm vs k8s", "cloudflare workers tech",
+    "vercel vs netlify choice", "cloud security best practices",
+
+    // CYBERSECURITY & HACKING (The Shield)
+    "cybersecurity news hacking 2026", "ethical hacking tutorial beginner", "penetration testing kali linux",
+    "zero trust architecture guide", "ransomware trends prevention", "owasp top 10 web security",
+    "network security firewalls vpn", "malware analysis reverse engineering", "cryptography for developers",
+    "bug bounty hunting tips", "security audits devsecops", "phishing attack prevention",
+    "social engineering awareness", "identity access management iam", "incident response plan",
+    "cloud security architecture", "cyber war documentaries", "advanced persistent threats",
+    "security tokens and mfa", "ethical hacking live streams",
+
+    // STARTUPS & BUSINESS (The Hustle)
+    "tech startup funding news monthly", "venture capital silicon valley trends", "Y Combinator startup demo day",
+    "SaaS startup growth marketing", "how to raise seed funding 2026", "fintech industry 2026 outlook",
+    "edtech virtual reality learning", "healthtech ai diagnostics", "proptech real estate tech",
+    "startup culture and burnout", "indie hackers solo developer", "product hunt launch strategy",
+    "agile scrum for product teams", "lean startup methodology", "business model canvas guide",
+    "angel investors for tech", "ipo vs acquisition exit", "founder stories and lessons",
+    "remote work future trends", "startup pitch deck examples",
+
+    // ROBOTICS & HARDWARE (The Steel)
+    "robotics AI automation future", "quantum computing breakthrough 2026", "tesla bot optimus progress",
+    "boston dynamics atlas new", "industrial robots manufacturing", "humanoid robot startups",
+    "raspberry pi projects 2026", "arduino iot home automation", "autonomous drones tech",
+    "space tech spacex starship", "ev battery tech news", "semiconductor manufacturing lithography",
+    "arm vs x86 cpu wars", "apple m4 chip benchmarks", "open source hardware risc-v",
+    "wearable tech health sensors", "smart city infrastructure", "3d printing metal composite",
+    "iot security vulnerabilities", "robot wars competition news",
+
+    // BLOCKCHAIN & WEB3 (The Ledger)
+    "blockchain cryptocurrency news daily", "web3 decentralized apps tutorial", "ethereum scaling layer 2",
+    "solana performance and dapps", "bitcoin lightning network news", "smart contract auditing rust",
+    "nft market trends 2026", "decentralized finance defi 2.0", "dao governance models",
+    "polygon zkevm latest", "cardano vs polkadot vs cosmos", "crypto wallet security",
+    "blockchain in supply chain", "tokenomics and game theory", "proof of stake vs work",
+    "cbdc global landscape news", "metaverse development unity", "web3 gaming play to earn",
+    "privacy coins zkp tech", "blockchain interoperability bridge"
 ];
 
 const getYouTubeVideos = async () => {
@@ -550,10 +580,28 @@ let isRefreshing = false;
 async function refreshAllData() {
     if (isRefreshing) return;
     isRefreshing = true;
-    console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Refreshing ALL data sources...`);
+    console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting background data refresh...`);
 
     try {
-        // Run Jobs/News and YouTube/Trends in parallel for faster population
+        // Pre-load from DB if cache is empty to avoid blank UI
+        if (!cache.dashboardData) {
+            console.log("💾 Loading initial data from Database...");
+            const [dbJobs, dbNews, dbVids] = await Promise.all([
+                pool.query('SELECT * FROM jobs ORDER BY posted_date DESC LIMIT 500'),
+                pool.query('SELECT * FROM news ORDER BY published_date DESC LIMIT 500'),
+                pool.query('SELECT * FROM youtube_videos ORDER BY id DESC LIMIT 60')
+            ]);
+
+            if (dbJobs.rows.length > 0 || dbNews.rows.length > 0) {
+                const jobs = dbJobs.rows.map(j => ({ ...j, type: 'job' }));
+                const news = dbNews.rows.map(n => ({ ...n, type: 'news' }));
+                cache.dashboardData = [...jobs, ...news];
+                cache.videos = dbVids.rows;
+                console.log(`✅ Pre-loaded ${cache.dashboardData.length} items from DB`);
+            }
+        }
+
+        // Run fresh scraping in parallel
         const scrapeMainData = async () => {
             const [jobs, news] = await Promise.all([getScrapedJobs(), getScrapedNews()]);
             cache.dashboardData = [...jobs, ...news].sort(() => Math.random() - 0.5);
@@ -562,8 +610,8 @@ async function refreshAllData() {
 
         const scrapeSecondaryData = async () => {
             const [videos, trends] = await Promise.all([getYouTubeVideos(), getLatestTrends()]);
-            cache.videos = videos;
-            cache.trends = trends;
+            if (videos?.length) cache.videos = videos;
+            if (trends?.length) cache.trends = trends;
             return { videos, trends };
         };
 
@@ -581,7 +629,7 @@ async function refreshAllData() {
             jobSources: JOB_APIS.length + JOB_RSS_FEEDS.length,
             newsSources: NEWS_RSS_FEEDS.length + HN_QUERIES.length,
         };
-        console.log(`✅ CACHE REFRESHED: ${jobs.length} jobs, ${news.length} news, ${(videos || []).length} videos`);
+        console.log(`✅ CACHE UPDATED: ${jobs.length} jobs, ${news.length} news, ${cache.videos.length} videos`);
     } catch (e) {
         console.error("❌ Refresh error:", e.message);
     } finally {
