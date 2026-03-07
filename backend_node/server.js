@@ -653,7 +653,7 @@ app.get('/api/dashboard-data', async (req, res) => {
 
 app.get('/api/latest-trends', async (req, res) => {
     try {
-        if (cache.trends) return res.json({ trends: cache.trends });
+        if (cache.trends && cache.trends.length > 0) return res.json({ trends: cache.trends });
         const trends = await getLatestTrends();
         res.json({ trends });
     } catch (e) { res.json({ trends: [] }); }
