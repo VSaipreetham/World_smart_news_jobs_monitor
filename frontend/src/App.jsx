@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Globe from 'react-globe.gl';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Activity, Briefcase, Globe2, Radio, Target, Zap, Bot, MapPin, Building2, Video, X, ExternalLink, TrendingUp, Newspaper, Filter, Database, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Layers, Search, ArrowUpRight } from 'lucide-react';
+import { Activity, Briefcase, Globe2, Radio, Target, Zap, Bot, MapPin, Building2, Video, X, ExternalLink, TrendingUp, Newspaper, Filter, Database, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Layers, Search, ArrowUpRight, Play } from 'lucide-react';
 
 const FEED_PER_PAGE = 24;
 const TREND_PER_PAGE = 18;
@@ -327,17 +327,30 @@ const App = () => {
             </div>
           </div>
           <div className="video-grid">
-            {videoSlice.map((v, i) => (
-              <div className="vid-card" key={v.videoId || i}>
-                <div className="vid-label"><span className="vid-dot"></span> {(v.channel || 'YT').toUpperCase()}</div>
-                <iframe src={`https://www.youtube.com/embed/${v.videoId}?autoplay=0&mute=1`} allowFullScreen
-                  style={{ border: 'none', width: '100%', height: '180px' }} title={v.title || `Stream ${i}`} loading="lazy" />
-                <div className="vid-info">
-                  <div className="vid-title">{v.title}</div>
-                  {v.published && <div className="vid-date">{v.published}</div>}
+            {videoSlice.map((v, i) => {
+              const vId = v.videoId || v.video_id;
+              if (!vId) return null;
+              return (
+                <div
+                  className="vid-card"
+                  key={vId || i}
+                  onClick={() => window.open(`https://www.youtube.com/watch?v=${vId}`, '_blank')}
+                  style={{ cursor: 'pointer' }}
+                >
+                  <div className="vid-label"><span className="vid-dot"></span> {(v.channel || 'YT').toUpperCase()}</div>
+                  <div className="vid-thumbnail">
+                    <img src={`https://img.youtube.com/vi/${vId}/hqdefault.jpg`} alt={v.title} loading="lazy" />
+                    <div className="vid-play-icon">
+                      <Play fill="white" size={24} color="white" />
+                    </div>
+                  </div>
+                  <div className="vid-info">
+                    <div className="vid-title">{v.title}</div>
+                    {v.published && <div className="vid-date">{v.published}</div>}
+                  </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
           <Pagination page={videoPage} totalPages={Math.ceil(filteredVideos.length / VIDEO_PER_PAGE)} total={filteredVideos.length}
             onPageChange={p => setVideoPage(p)} label={`Page ${videoPage}`} />
