@@ -567,6 +567,10 @@ async function refreshAllData() {
 // ═══════════════════════════════════════════════════════════════
 // API ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
+app.get('/', (req, res) => {
+    res.send('<h1>✅ Smart News & Job Tracker API Backend is Running!</h1><p>Use /api/dashboard-data to access the endpoints.</p>');
+});
+
 app.get('/api/dashboard-data', async (req, res) => {
     if (cache.dashboardData) return res.json({ data: cache.dashboardData, lastRefresh: cache.lastRefresh, stats: cache.stats });
     const [jobs, news] = await Promise.all([getScrapedJobs(), getScrapedNews()]);
