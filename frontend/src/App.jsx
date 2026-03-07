@@ -57,13 +57,15 @@ const App = () => {
   const [portalSearch, setPortalSearch] = useState('');
   const [portalLoading, setPortalLoading] = useState(false);
 
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         const [dashRes, aiRes, trendRes] = await Promise.all([
-          fetch('/api/dashboard-data'),
-          fetch('/api/ai-insights'),
-          fetch('/api/latest-trends')
+          fetch(`${API_BASE}/api/dashboard-data`),
+          fetch(`${API_BASE}/api/ai-insights`),
+          fetch(`${API_BASE}/api/latest-trends`)
         ]);
         const dashJson = await dashRes.json();
         setData(dashJson.data || []);
@@ -88,7 +90,7 @@ const App = () => {
   const fetchPortalJobs = async (page = 1, search = '') => {
     setPortalLoading(true);
     try {
-      const res = await fetch(`/api/portal-jobs?page=${page}&limit=${PORTAL_PER_PAGE}&search=${encodeURIComponent(search)}`);
+      const res = await fetch(`${API_BASE}/api/portal-jobs?page=${page}&limit=${PORTAL_PER_PAGE}&search=${encodeURIComponent(search)}`);
       const json = await res.json();
       setPortalJobs(json.jobs || []);
       setPortalTotal(json.total || 0);
@@ -129,7 +131,7 @@ const App = () => {
     if (!searchQuery) return;
     setLearningCompany(true);
     try {
-      const res = await fetch(`/api/company-intel?company=${encodeURIComponent(searchQuery)}`);
+      const res = await fetch(`${API_BASE}/api/company-intel?company=${encodeURIComponent(searchQuery)}`);
       const json = await res.json();
       if (json?.branches) {
         setCompanyNodes(json.branches.map((b, i) => ({
