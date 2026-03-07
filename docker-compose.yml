@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - monitor_net
+
+  backend:
+    build:
+      context: ./backend_node
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend_node/.env
+    restart: unless-stopped
+    networks:
+      - monitor_net
+
+  smart_job_portal:
+    build:
+      context: ./smart_job_portal
+    ports:
+      - "8501:8501"
+    env_file:
+      - ./smart_job_portal/.env
+    restart: unless-stopped
+    networks:
+      - monitor_net
+
+networks:
+  monitor_net:
+    driver: bridge

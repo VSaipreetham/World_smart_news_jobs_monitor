@@ -61,9 +61,9 @@ const App = () => {
     const fetchData = async () => {
       try {
         const [dashRes, aiRes, trendRes] = await Promise.all([
-          fetch('http://localhost:8000/api/dashboard-data'),
-          fetch('http://localhost:8000/api/ai-insights'),
-          fetch('http://localhost:8000/api/latest-trends')
+          fetch('/api/dashboard-data'),
+          fetch('/api/ai-insights'),
+          fetch('/api/latest-trends')
         ]);
         const dashJson = await dashRes.json();
         setData(dashJson.data || []);
@@ -88,7 +88,7 @@ const App = () => {
   const fetchPortalJobs = async (page = 1, search = '') => {
     setPortalLoading(true);
     try {
-      const res = await fetch(`http://localhost:8000/api/portal-jobs?page=${page}&limit=${PORTAL_PER_PAGE}&search=${encodeURIComponent(search)}`);
+      const res = await fetch(`/api/portal-jobs?page=${page}&limit=${PORTAL_PER_PAGE}&search=${encodeURIComponent(search)}`);
       const json = await res.json();
       setPortalJobs(json.jobs || []);
       setPortalTotal(json.total || 0);
@@ -129,7 +129,7 @@ const App = () => {
     if (!searchQuery) return;
     setLearningCompany(true);
     try {
-      const res = await fetch(`http://localhost:8000/api/company-intel?company=${encodeURIComponent(searchQuery)}`);
+      const res = await fetch(`/api/company-intel?company=${encodeURIComponent(searchQuery)}`);
       const json = await res.json();
       if (json?.branches) {
         setCompanyNodes(json.branches.map((b, i) => ({
