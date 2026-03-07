@@ -1,0 +1,17 @@
+streamlit
+APScheduler
+SQLAlchemy
+requests
+beautifulsoup4
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+python-dotenv
+pandas
+openpyxl
+google-generativeai
+sentence-transformers
+transformers
+torch
+pdfplumber
+psycopg2-binary
