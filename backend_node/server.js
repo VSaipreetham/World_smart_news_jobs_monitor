@@ -160,8 +160,8 @@ function getPreciseCoords(loc) {
 async function getAIInsight(prompt) {
     const models = [
         { name: "Gemini 2.0 Flash", model: "gemini-2.0-flash", type: "gemini" },
-        { name: "Gemini 1.5 Flash", model: "gemini-1.5-flash", type: "gemini" },
-        { name: "Gemini 2.5 Flash Preview", model: "gemini-2.5-flash-preview-05-20", type: "gemini" },
+        { name: "Gemini 1.5 Flash", model: "gemini-1.5-flash-latest", type: "gemini" },
+        { name: "Gemini 1.5 Pro", model: "gemini-1.5-pro-latest", type: "gemini" },
     ];
     // Try Gemini models
     for (const m of models) {
@@ -169,11 +169,13 @@ async function getAIInsight(prompt) {
             const model = genAI.getGenerativeModel({ model: m.model, generationConfig: { responseMimeType: "application/json" } });
             const result = await model.generateContent(prompt);
             return JSON.parse(result.response.text());
-        } catch (e) { /* next model */ }
+        } catch (e) {
+            console.error(`AI Model ${m.name} failed:`, e.message);
+        }
     }
     // OpenRouter fallbacks
     const orModels = [
-        { name: "Qwen3", model: "qwen/qwen3-235b-a22b", token: process.env.Qwen3_80b_token },
+        { name: "Qwen3", model: "qwen/qwen-2.5-72b-instruct", token: process.env.Qwen3_80b_token },
         { name: "GPT-4o-mini", model: "openai/gpt-4o-mini", token: process.env['gpt-oss-120b_token'] },
     ];
     for (const m of orModels) {
@@ -181,11 +183,14 @@ async function getAIInsight(prompt) {
             const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
                 model: m.model,
                 messages: [{ role: "user", content: prompt + "\n\nReturn ONLY valid JSON." }],
-                temperature: 0.5
+                temperature: 0.5,
+                max_tokens: 1500
             }, { headers: { "Authorization": `Bearer ${m.token}`, "Content-Type": "application/json" }, timeout: API_TIMEOUT });
             const raw = res.data.choices[0].message.content;
             return JSON.parse(raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
-        } catch (e) { /* next */ }
+        } catch (e) {
+            console.error(`OpenRouter Model ${m.name} failed:`, e.message);
+        }
     }
     return null;
 }
@@ -497,7 +502,7 @@ const saveJobsToNeonDB = async (jobsArr) => {
         const chunk = jobsArr.slice(i, i + 50);
         const values = []; const placeholders = []; let c = 1;
         for (const j of chunk) {
-            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},'open')`);
+            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},'NEW')`);
             values.push(j.title, j.company, j.url, j.source || j.time, j.location || 'Remote', j.pay || 'N/A', new Date().toISOString());
         }
         try {
@@ -578,9 +583,12 @@ app.get('/api/latest-trends', async (req, res) => {
 app.get('/api/ai-insights', async (req, res) => {
     let videos = cache.videos || [];
     try {
-        if (!videos.length) videos = await getYouTubeVideos();
         const newsSlice = (cache.dashboardData || []).filter(d => d.type === 'news').slice(0, 10);
         const jobsSlice = (cache.dashboardData || []).filter(d => d.type === 'job').slice(0, 5);
+
+        if (newsSlice.length === 0 || jobsSlice.length === 0) {
+            return res.json({ summary_news: "Initializing Live Intelligence.", summary_jobs: "Starting Global Scan.", videos });
+        }
 
         const prompt = `You are a Silicon Valley Intelligence Analyst. Analyze:
 NEWS: ${newsSlice.map(n => n.headline).join(' | ')}
