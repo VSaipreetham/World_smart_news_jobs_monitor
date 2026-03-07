@@ -544,24 +544,49 @@ const saveVideosToNeonDB = async (vids) => {
 // ═══════════════════════════════════════════════════════════════
 // CACHE + AUTO-REFRESH
 // ═══════════════════════════════════════════════════════════════
-let cache = { dashboardData: null, videos: null, trends: null, lastRefresh: 0, stats: {} };
+let cache = { dashboardData: null, videos: [], trends: [], lastRefresh: 0, stats: {} };
+let isRefreshing = false;
 
 async function refreshAllData() {
-    console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Refreshing ALL data from ${JOB_APIS.length + JOB_RSS_FEEDS.length} job + ${NEWS_RSS_FEEDS.length + HN_QUERIES.length} news sources...`);
+    if (isRefreshing) return;
+    isRefreshing = true;
+    console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Refreshing ALL data sources...`);
+
     try {
-        const [jobs, news] = await Promise.all([getScrapedJobs(), getScrapedNews()]);
-        cache.dashboardData = [...jobs, ...news].sort(() => Math.random() - 0.5);
-        cache.videos = await getYouTubeVideos();
-        cache.trends = await getLatestTrends();
+        // Run Jobs/News and YouTube/Trends in parallel for faster population
+        const scrapeMainData = async () => {
+            const [jobs, news] = await Promise.all([getScrapedJobs(), getScrapedNews()]);
+            cache.dashboardData = [...jobs, ...news].sort(() => Math.random() - 0.5);
+            return { jobs, news };
+        };
+
+        const scrapeSecondaryData = async () => {
+            const [videos, trends] = await Promise.all([getYouTubeVideos(), getLatestTrends()]);
+            cache.videos = videos;
+            cache.trends = trends;
+            return { videos, trends };
+        };
+
+        const [{ jobs, news }, { videos, trends }] = await Promise.all([
+            scrapeMainData(),
+            scrapeSecondaryData()
+        ]);
+
         cache.lastRefresh = Date.now();
         cache.stats = {
-            totalJobs: jobs.length, totalNews: news.length,
-            totalVideos: cache.videos.length, totalTrends: cache.trends.length,
+            totalJobs: jobs.length,
+            totalNews: news.length,
+            totalVideos: (videos || []).length,
+            totalTrends: (trends || []).length,
             jobSources: JOB_APIS.length + JOB_RSS_FEEDS.length,
             newsSources: NEWS_RSS_FEEDS.length + HN_QUERIES.length,
         };
-        console.log(`✅ CACHE REFRESHED: ${jobs.length} jobs, ${news.length} news, ${cache.videos.length} videos, ${cache.trends.length} trends`);
-    } catch (e) { console.error("❌ Refresh error:", e.message); }
+        console.log(`✅ CACHE REFRESHED: ${jobs.length} jobs, ${news.length} news, ${(videos || []).length} videos`);
+    } catch (e) {
+        console.error("❌ Refresh error:", e.message);
+    } finally {
+        isRefreshing = false;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -686,7 +711,7 @@ app.listen(PORT, async () => {
     console.log(`📊 Job Sources: ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS = ${JOB_APIS.length + JOB_RSS_FEEDS.length} total`);
     console.log(`📰 News Sources: ${NEWS_RSS_FEEDS.length} RSS + ${HN_QUERIES.length} HN queries = ${NEWS_RSS_FEEDS.length + HN_QUERIES.length} total`);
     await ensureDBTables();
-    setTimeout(() => refreshAllData(), 3000);
+    refreshAllData(); // Trigger immediately on start
     setInterval(() => refreshAllData(), REFRESH_INTERVAL);
     setInterval(() => purgeDatabase(), DB_PURGE_INTERVAL);
     console.log(`⏱️  Auto-refresh: every 10 min | DB purge: every 3 hours`);
