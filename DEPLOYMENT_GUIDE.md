@@ -31,3 +31,7 @@ Vercel is the fastest way to host the 3D globe visualization UI.
 5. Click **Deploy**.
 
 🎉 **That's it!** The full app is now live on the internet, automatically syncing jobs every 10 minutes into Neon DB, and reading insights from the AI APIs!
+
+### 🔗 Current Active Deployment:
+*   **Global UI:** [https://my-project-2-l8ayoqad1-vsaipreethams-projects.vercel.app/](https://my-project-2-l8ayoqad1-vsaipreethams-projects.vercel.app/)
+*   **API Node:** [https://monitor-backend-jd0q.onrender.com](https://monitor-backend-jd0q.onrender.com)

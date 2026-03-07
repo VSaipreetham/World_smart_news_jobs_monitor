@@ -2,6 +2,11 @@
 
 > Real-time global intelligence dashboard tracking **200+ job sources** and **1000+ news sources** worldwide with AI-powered insights, 3D globe visualization, and automated database management.
 
+### 🔗 Live Production Links
+*   **🌍 Live Dashboard:** [my-project-2.vercel.app](https://my-project-2-l8ayoqad1-vsaipreethams-projects.vercel.app/)
+*   **📡 Backend API:** [monitor-backend-jd0q.onrender.com](https://monitor-backend-jd0q.onrender.com)
+*   **💼 Smart Job Portal:** [smart-job-portal-xxxx.onrender.com](https://dashboard.render.com) (Check your Render Dashboard for exact link)
+
 ## ✨ Features
 
 - 🌍 **3D Globe Visualization** — Live job postings (green) and news events (red) plotted on an interactive globe
