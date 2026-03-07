@@ -160,8 +160,8 @@ function getPreciseCoords(loc) {
 async function getAIInsight(prompt) {
     const models = [
         { name: "Gemini 2.0 Flash", model: "gemini-2.0-flash", type: "gemini" },
-        { name: "Gemini 1.5 Flash", model: "gemini-1.5-flash-latest", type: "gemini" },
-        { name: "Gemini 1.5 Pro", model: "gemini-1.5-pro-latest", type: "gemini" },
+        { name: "Gemini 1.5 Flash", model: "gemini-1.5-flash", type: "gemini" },
+        { name: "Gemini 1.5 Pro", model: "gemini-1.5-pro", type: "gemini" },
     ];
     // Try Gemini models
     for (const m of models) {
@@ -170,7 +170,9 @@ async function getAIInsight(prompt) {
             const result = await model.generateContent(prompt);
             return JSON.parse(result.response.text());
         } catch (e) {
-            console.error(`AI Model ${m.name} failed:`, e.message);
+            if (!e.message.includes('404') && !e.message.includes('429')) {
+                console.error(`AI Model ${m.name} failed:`, e.message);
+            }
         }
     }
     // OpenRouter fallbacks
