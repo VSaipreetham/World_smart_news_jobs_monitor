@@ -394,4 +394,27 @@ const HN_QUERIES = [
     "fintech OR neobank",
 ];
 
-module.exports = { JOB_APIS, JOB_RSS_FEEDS, NEWS_RSS_FEEDS, HN_QUERIES };
+const JOB_BOARD_SOURCES = [
+    { name: "Naukri", host: "naukri.com", url: "https://www.naukri.com/software-developer-jobs", region: "India" },
+    { name: "LinkedIn", host: "linkedin.com", url: "https://www.linkedin.com/jobs/search/?keywords=software%20engineer&location=India", region: "Global" },
+    { name: "Indeed India", host: "indeed.com", url: "https://in.indeed.com/jobs?q=software+engineer&l=India", region: "India" },
+    { name: "Foundit", host: "foundit.in", url: "https://www.foundit.in/srp/results?query=software%20engineer", region: "India" },
+    { name: "Shine", host: "shine.com", url: "https://www.shine.com/job-search/software-developer-jobs", region: "India" },
+    { name: "TimesJobs", host: "timesjobs.com", url: "https://www.timesjobs.com/candidate/job-search.html?searchType=personalizedSearch&txtKeywords=software+developer", region: "India" },
+    { name: "Cutshort", host: "cutshort.io", url: "https://cutshort.io/jobs/software-engineer-jobs", region: "India" },
+    { name: "Wellfound", host: "wellfound.com", url: "https://wellfound.com/jobs", region: "Startup" },
+    { name: "Hirist", host: "hirist.com", url: "https://www.hirist.com/search/software-developer-jobs.html", region: "India" },
+    { name: "Internshala", host: "internshala.com", url: "https://internshala.com/jobs/software-development-jobs/", region: "India" },
+    { name: "Freshersworld", host: "freshersworld.com", url: "https://www.freshersworld.com/jobs/category/it-software-job-vacancies", region: "India" },
+    { name: "LetsIntern", host: "letsintern.com", url: "https://www.letsintern.com/internships/software-development-internships", region: "India" },
+    { name: "Apna", host: "apna.co", url: "https://apna.co/jobs/software_developer-jobs", region: "India" },
+    { name: "WorkIndia", host: "workindia.in", url: "https://www.workindia.in/software-developer-jobs/", region: "India" },
+    { name: "Quikr Jobs", host: "quikr.com", url: "https://www.quikr.com/jobs/software-developer+zwqxj1463569647", region: "India" },
+    { name: "Glassdoor India", host: "glassdoor.co.in", url: "https://www.glassdoor.co.in/Job/india-software-engineer-jobs-SRCH_IL.0,5_IN115_KO6,23.htm", region: "India" },
+    { name: "Herkey", host: "herkey.com", url: "https://www.herkey.com/jobs", region: "India" },
+    { name: "Freelancer", host: "freelancer.com", url: "https://www.freelancer.com/jobs/software-development/", region: "Global" },
+    { name: "Jobsora India", host: "jobsora.com", url: "https://in.jobsora.com/jobs-software-developer", region: "India" },
+    { name: "NCS Gov", host: "ncs.gov.in", url: "https://www.ncs.gov.in/job-seeker/Pages/Search.aspx?K=software%20developer", region: "India" },
+];
+
+module.exports = { JOB_APIS, JOB_RSS_FEEDS, JOB_BOARD_SOURCES, NEWS_RSS_FEEDS, HN_QUERIES };

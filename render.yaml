@@ -16,6 +16,22 @@ services:
         sync: false
       - key: gpt-oss-120b_token
         sync: false
+      - key: Qwen3_4b_token
+        sync: false
+      - key: trinity-large-preview_token
+        sync: false
+      - key: Gemma3b_token
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: Gemma4_26b_token
+        sync: false
+      - key: Gemma4_31b_token
+        sync: false
+      - key: OPENROUTER_MODELS
+        sync: false
+      - key: OPENROUTER_SITE_URL
+        value: https://my-project-2-l8ayoqad1-vsaipreethams-projects.vercel.app
 
   - type: web
     name: smart-job-portal

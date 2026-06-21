@@ -1,26 +1,112 @@
+const path = require('path');
 require('dotenv').config();
+require('dotenv').config({ path: path.resolve(__dirname, '../backend/.env'), override: false });
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
 const { Pool } = require('pg');
 const axios = require('axios');
 const Parser = require('rss-parser');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const ytSearch = require('yt-search');
-const { JOB_APIS, JOB_RSS_FEEDS, NEWS_RSS_FEEDS, HN_QUERIES } = require('./sources');
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+const { JOB_APIS, JOB_RSS_FEEDS, JOB_BOARD_SOURCES, NEWS_RSS_FEEDS, HN_QUERIES } = require('./sources');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 // ═══════════════════════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════════════════════
-const genAI = new GoogleGenerativeAI(process.env.Google_token);
-const REFRESH_INTERVAL = 10 * 60 * 1000;   // 10 minutes
-const DB_PURGE_INTERVAL = 3 * 60 * 60 * 1000; // 3 hours
+const genAI = process.env.Google_token ? new GoogleGenerativeAI(process.env.Google_token) : null;
+const REFRESH_INTERVAL = Number(process.env.REFRESH_INTERVAL_MS || 10 * 60 * 1000);
+const DB_PURGE_INTERVAL = Number(process.env.DB_MAINTENANCE_INTERVAL_MS || 30 * 60 * 1000);
+const DB_RETENTION_HOURS = Number(process.env.DB_RETENTION_HOURS || 24);
 const RSS_TIMEOUT = 8000;  // 8s per feed
 const API_TIMEOUT = 10000; // 10s per API
 const BATCH_SIZE = 25;     // parallel fetch batch size
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.5';
+const OPENAI_FALLBACK_MODELS = (process.env.OPENAI_FALLBACK_MODELS || 'gpt-5.4,gpt-5.2,gpt-4.1-mini')
+    .split(',')
+    .map(m => m.trim())
+    .filter(Boolean);
+const DEFAULT_OPENROUTER_MODELS = [
+    'openrouter/free',
+    'google/gemma-4-26b-a4b-it:free',
+    'google/gemma-4-31b-it:free',
+    'qwen/qwen3-next-80b-a3b-instruct:free',
+    'openai/gpt-oss-120b:free',
+    'openai/gpt-oss-20b:free',
+    'qwen/qwen3-coder:free',
+    'nvidia/nemotron-3-super-120b-a12b:free',
+    'nvidia/nemotron-3-nano-30b-a3b:free',
+    'meta-llama/llama-3.3-70b-instruct:free',
+    'cohere/north-mini-code:free',
+];
+const OPENROUTER_MODELS = (process.env.OPENROUTER_MODELS || DEFAULT_OPENROUTER_MODELS.join(','))
+    .split(',')
+    .map(m => m.trim())
+    .filter(Boolean);
+const AI_CIRCUIT_BREAKER_MS = Number(process.env.AI_CIRCUIT_BREAKER_MS || 5 * 60 * 1000);
+const YOUTUBE_QUERY_LIMIT = Number(process.env.YOUTUBE_QUERY_LIMIT || 36);
+const VIDEO_REFRESH_INTERVAL_MS = Number(process.env.VIDEO_REFRESH_INTERVAL_MS || 10 * 60 * 1000);
+const VIDEO_MAX_AGE_DAYS = Number(process.env.VIDEO_MAX_AGE_DAYS || 14);
+const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 14);
+const VIDEO_DB_RETENTION_HOURS = Number(process.env.VIDEO_DB_RETENTION_HOURS || 72);
+const AI_MODES = ['auto', 'openai', 'gemini', 'openrouter', 'offline'];
+let aiMode = AI_MODES.includes(String(process.env.AI_MODE || '').toLowerCase())
+    ? String(process.env.AI_MODE).toLowerCase()
+    : 'auto';
+
+function getTotalJobSources() {
+    return JOB_APIS.length + JOB_RSS_FEEDS.length + JOB_BOARD_SOURCES.length;
+}
+
+function getAIModePayload() {
+    const openRouterTokens = getOpenRouterTokens();
+    return {
+        active: aiMode,
+        modes: [
+            { id: 'auto', label: 'Auto fallback', available: Boolean(process.env.OPENAI_API_KEY || genAI || process.env.OPENROUTER_API_KEY || process.env.Qwen3_80b_token || process.env['gpt-oss-120b_token']) },
+            { id: 'openai', label: 'OpenAI', available: Boolean(process.env.OPENAI_API_KEY), primaryModel: OPENAI_MODEL },
+            { id: 'gemini', label: 'Gemini', available: Boolean(genAI) },
+            { id: 'openrouter', label: 'OpenRouter', available: openRouterTokens.length > 0, primaryModel: OPENROUTER_MODELS[0], configuredModels: OPENROUTER_MODELS },
+            { id: 'offline', label: 'Offline deterministic', available: true },
+        ],
+        runtime: {
+            provider: aiRuntime.lastProvider,
+            model: aiRuntime.lastModel,
+            lastError: aiRuntime.lastError,
+            available: aiRuntime.disabledUntil <= Date.now(),
+            disabledUntilISO: aiRuntime.disabledUntil ? new Date(aiRuntime.disabledUntil).toISOString() : null,
+        },
+    };
+}
+
+function getOpenRouterTokens() {
+    const extraNames = String(process.env.OPENROUTER_EXTRA_TOKEN_NAMES || '')
+        .split(',')
+        .map(name => name.trim())
+        .filter(Boolean);
+    const names = [
+        'OPENROUTER_API_KEY',
+        'Qwen3_80b_token',
+        'gpt-oss-120b_token',
+        'Qwen3_4b_token',
+        'trinity-large-preview_token',
+        'Gemma3b_token',
+        'Gemma4_26b_token',
+        'Gemma4_31b_token',
+        ...extraNames,
+    ];
+    return names
+        .map(name => process.env[name])
+        .filter(Boolean)
+        .filter((token, index, arr) => arr.indexOf(token) === index);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // DATABASE (Neon PostgreSQL)
@@ -43,6 +129,13 @@ async function ensureDBTables() {
                 title TEXT, company TEXT, url TEXT UNIQUE,
                 source TEXT, location TEXT, pay TEXT,
                 posted_date TEXT, status TEXT DEFAULT 'open',
+                notes TEXT,
+                match_score INTEGER DEFAULT 0,
+                applied_at TIMESTAMP,
+                follow_up_at TIMESTAMP,
+                archived_at TIMESTAMP,
+                refreshed_at TIMESTAMP DEFAULT NOW(),
+                refresh_run_id TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS news (
@@ -50,30 +143,54 @@ async function ensureDBTables() {
                 headline TEXT, source TEXT, url TEXT UNIQUE,
                 category TEXT, snippet TEXT,
                 published_date TEXT,
+                refreshed_at TIMESTAMP DEFAULT NOW(),
+                refresh_run_id TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS youtube_videos (
                 id SERIAL PRIMARY KEY,
                 title TEXT, video_id TEXT UNIQUE,
                 channel TEXT, published TEXT,
+                views BIGINT DEFAULT 0,
+                published_ago TEXT,
+                refreshed_at TIMESTAMP DEFAULT NOW(),
                 created_at TIMESTAMP DEFAULT NOW()
             );
+        `);
+        await pool.query(`
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS notes TEXT;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS match_score INTEGER DEFAULT 0;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied_at TIMESTAMP;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMP;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMP DEFAULT NOW();
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS refresh_run_id TEXT;
+            ALTER TABLE news ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMP DEFAULT NOW();
+            ALTER TABLE news ADD COLUMN IF NOT EXISTS refresh_run_id TEXT;
+            ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS views BIGINT DEFAULT 0;
+            ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS published_ago TEXT;
+            ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMP DEFAULT NOW();
+        `);
+        await pool.query(`
+            UPDATE jobs
+            SET status = 'open'
+            WHERE status IS NULL OR LOWER(status) IN ('new', 'queued') OR status = 'NEW';
         `);
         console.log("✅ DB tables ensured");
     } catch (e) { console.error("DB table creation error:", e.message); }
 }
 
 // ═══════ 3-HOUR DATABASE PURGE ═══════
-async function purgeDatabase() {
+async function pruneDatabase() {
     if (!pool) return;
     console.log(`\n🗑️ [${new Date().toLocaleTimeString()}] PURGING DATABASE - 3 hour cycle...`);
     try {
-        await pool.query('TRUNCATE TABLE jobs RESTART IDENTITY CASCADE;');
-        await pool.query('TRUNCATE TABLE news RESTART IDENTITY CASCADE;');
-        await pool.query('TRUNCATE TABLE youtube_videos RESTART IDENTITY CASCADE;');
+        const interval = `${DB_RETENTION_HOURS} hours`;
+        const videoInterval = `${VIDEO_DB_RETENTION_HOURS} hours`;
+        await pool.query("DELETE FROM jobs WHERE created_at < NOW() - $1::interval;", [interval]);
+        await pool.query("DELETE FROM news WHERE created_at < NOW() - $1::interval;", [interval]);
+        await pool.query("DELETE FROM youtube_videos WHERE COALESCE(refreshed_at, created_at) < NOW() - $1::interval;", [videoInterval]);
         console.log("✅ Database purged successfully. Fresh collection starting...");
-        // Immediately refresh after purge
-        await refreshAllData();
     } catch (e) { console.error("❌ Purge error:", e.message); }
 }
 
@@ -129,71 +246,302 @@ function getRandomHub() {
 
 const geoCache = new Map();
 
+function hashString(value = '') {
+    let hash = 0;
+    for (let i = 0; i < value.length; i += 1) {
+        hash = ((hash << 5) - hash) + value.charCodeAt(i);
+        hash |= 0;
+    }
+    return Math.abs(hash);
+}
+
+function getTimestamp(value) {
+    const time = value ? new Date(value).getTime() : NaN;
+    return Number.isFinite(time) ? time : 0;
+}
+
+function isRecentDate(value, maxAgeDays = NEWS_MAX_AGE_DAYS) {
+    const time = getTimestamp(value);
+    if (!time) return false;
+    const ageMs = Date.now() - time;
+    return ageMs >= 0 && ageMs <= maxAgeDays * 24 * 60 * 60 * 1000;
+}
+
+function sortByDateDesc(items = [], dateKey = 'date') {
+    return [...items].sort((a, b) => getTimestamp(b[dateKey]) - getTimestamp(a[dateKey]));
+}
+
+function inferCoordsFromText(value = '') {
+    const text = value.toLowerCase();
+    const directMatches = [
+        ['san francisco', 'San Francisco'], ['sf', 'San Francisco'], ['new york', 'New York'],
+        ['toronto', 'Toronto'], ['austin', 'Austin'], ['seattle', 'Seattle'],
+        ['mexico', 'Mexico City'], ['sao paulo', 'Sao Paulo'], ['são paulo', 'Sao Paulo'],
+        ['buenos aires', 'Buenos Aires'], ['bogota', 'Bogota'], ['bogotá', 'Bogota'],
+        ['london', 'London'], ['berlin', 'Berlin'], ['paris', 'Paris'],
+        ['amsterdam', 'Amsterdam'], ['stockholm', 'Stockholm'], ['madrid', 'Madrid'],
+        ['lagos', 'Lagos'], ['nairobi', 'Nairobi'], ['cape town', 'Cape Town'],
+        ['cairo', 'Cairo'], ['dubai', 'Dubai'], ['tel aviv', 'Tel Aviv'],
+        ['bengaluru', 'Bengaluru'], ['bangalore', 'Bengaluru'], ['mumbai', 'Mumbai'],
+        ['delhi', 'Delhi'], ['tokyo', 'Tokyo'], ['singapore', 'Singapore'],
+        ['seoul', 'Seoul'], ['shanghai', 'Shanghai'], ['beijing', 'Beijing'],
+        ['shenzhen', 'Shenzhen'], ['jakarta', 'Jakarta'], ['sydney', 'Sydney'],
+        ['melbourne', 'Melbourne'], ['auckland', 'Auckland'], ['riyadh', 'Riyadh'],
+        ['zurich', 'Zurich'], ['dublin', 'Dublin'], ['warsaw', 'Warsaw'],
+        ['lisbon', 'Lisbon'], ['helsinki', 'Helsinki'],
+    ];
+    const match = directMatches.find(([needle]) => text.includes(needle));
+    if (match) return LAND_FALLBACKS.find(hub => hub.name === match[1]) || getRandomHub();
+    return LAND_FALLBACKS[hashString(value) % LAND_FALLBACKS.length];
+}
+
 async function batchGeocodeWithAI(locations) {
     const uniqueLocs = [...new Set(locations)].filter(l => l && !geoCache.has(l));
     if (uniqueLocs.length === 0) return;
-    // Process in chunks of 30 to avoid token limits
-    for (let i = 0; i < uniqueLocs.length; i += 30) {
-        const chunk = uniqueLocs.slice(i, i + 30);
-        const prompt = `Geocode these locations. If "Remote", pick a random major tech hub. Return ONLY JSON: keys=location strings, values={lat,lng}.\nLocations: ${JSON.stringify(chunk)}`;
-        try {
-            const result = await getAIInsight(prompt);
-            if (result) {
-                Object.entries(result).forEach(([loc, coords]) => {
-                    if (coords && typeof coords.lat === 'number' && typeof coords.lng === 'number') {
-                        geoCache.set(loc, coords);
-                    }
-                });
-            }
-        } catch (e) { /* silently skip */ }
-    }
+    uniqueLocs.forEach(loc => geoCache.set(loc, inferCoordsFromText(loc)));
 }
 
 function getPreciseCoords(loc) {
     if (geoCache.has(loc)) return geoCache.get(loc);
-    return getRandomHub();
+    return inferCoordsFromText(loc || 'global');
+}
+
+function toJobPoint(j, index = 0) {
+    const hub = getPreciseCoords(j.location || j.location_name || j.company || j.title || 'Remote');
+    return {
+        id: j.id ? `job-db-${j.id}` : `job-${index}-${hashString(j.url || j.title || String(index))}`,
+        type: 'job',
+        lat: hub.lat + (Math.random() - 0.5) * 0.08,
+        lng: hub.lng + (Math.random() - 0.5) * 0.08,
+        company: j.company || j.company_or_source || 'Company',
+        title: j.title || 'Open role',
+        location: j.location || j.location_name || 'Remote',
+        url: j.url || '#',
+        isRemote: /remote|anywhere|global|worldwide/i.test(j.location || ''),
+        time: j.time || j.posted_date || 'cached',
+        collectedAt: j.refreshed_at ? new Date(j.refreshed_at).getTime() : (j.created_at ? new Date(j.created_at).getTime() : 0),
+        refreshRunId: j.refresh_run_id || null,
+        size: 0.4,
+        color: '#15b86a',
+    };
+}
+
+function toNewsPoint(n, index = 0) {
+    const hub = getPreciseCoords(n.headline || n.title || n.source || 'Global');
+    return {
+        id: n.id ? `news-db-${n.id}` : `news-${index}-${hashString(n.url || n.headline || String(index))}`,
+        type: 'news',
+        lat: hub.lat + (Math.random() - 0.5) * 0.1,
+        lng: hub.lng + (Math.random() - 0.5) * 0.1,
+        headline: n.headline || n.title || 'News signal',
+        source: n.source || n.company_or_source || 'Source',
+        location: n.location || 'Global',
+        url: n.url || '#',
+        time: n.time || n.published_date || 'cached',
+        collectedAt: n.refreshed_at ? new Date(n.refreshed_at).getTime() : (n.created_at ? new Date(n.created_at).getTime() : 0),
+        refreshRunId: n.refresh_run_id || null,
+        radius: 4.5,
+        color: '#ef4444',
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════
 // MULTI-MODEL AI FALLBACK MATRIX
 // ═══════════════════════════════════════════════════════════════
-async function getAIInsight(prompt) {
-    const models = [
-        { name: "Gemini 2.0 Flash", model: "gemini-2.0-flash", type: "gemini" },
-        { name: "Gemini 1.5 Flash", model: "gemini-1.5-flash", type: "gemini" },
-        { name: "Gemini 1.5 Pro", model: "gemini-1.5-pro", type: "gemini" },
-    ];
-    // Try Gemini models
-    for (const m of models) {
+let aiRuntime = {
+    lastProvider: null,
+    lastModel: null,
+    lastError: null,
+    disabledUntil: 0,
+    attempts: [],
+};
+
+function parseJsonFromModel(raw) {
+    if (!raw) return null;
+    if (typeof raw !== 'string') return raw;
+    const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    try {
+        return JSON.parse(cleaned);
+    } catch (_) {
+        const start = cleaned.indexOf('{');
+        const end = cleaned.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+            try {
+                return JSON.parse(cleaned.slice(start, end + 1));
+            } catch (_) { }
+        }
+        if (cleaned.length > 0) return { answer: cleaned, result: cleaned, text: cleaned };
+        throw new Error('Model response was not valid JSON');
+    }
+}
+
+function coerceModelObject(ai) {
+    if (!ai || typeof ai !== 'object') return ai;
+    for (const key of ['answer', 'result', 'text']) {
+        const value = ai[key];
+        if (typeof value !== 'string') continue;
+        const trimmed = value.trim();
+        if (!trimmed.startsWith('{')) continue;
         try {
-            const model = genAI.getGenerativeModel({ model: m.model, generationConfig: { responseMimeType: "application/json" } });
-            const result = await model.generateContent(prompt);
-            return JSON.parse(result.response.text());
-        } catch (e) {
-            if (!e.message.includes('404') && !e.message.includes('429')) {
-                console.error(`AI Model ${m.name} failed:`, e.message);
+            return { ...ai, ...JSON.parse(trimmed) };
+        } catch (_) {
+            const match = trimmed.match(/"(answer|result)"\s*:\s*"([\s\S]*?)"\s*(,\s*"[^"]+"\s*:|}\s*$)/);
+            if (match?.[2]) {
+                return { ...ai, [match[1]]: match[2].replace(/\\n/g, '\n').replace(/\\"/g, '"') };
             }
         }
     }
-    // OpenRouter fallbacks
-    const orModels = [
-        { name: "Qwen3", model: "qwen/qwen-2.5-72b-instruct", token: process.env.Qwen3_80b_token },
-        { name: "GPT-4o-mini", model: "openai/gpt-4o-mini", token: process.env['gpt-oss-120b_token'] },
+    return ai;
+}
+
+function cleanModelText(value) {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    if (!trimmed.startsWith('{')) return trimmed;
+    try {
+        const parsed = JSON.parse(trimmed);
+        return parsed.answer || parsed.result || parsed.text || trimmed;
+    } catch (_) {
+        const match = trimmed.match(/"(answer|result)"\s*:\s*"([\s\S]*?)"\s*(,\s*"[^"]+"\s*:|}\s*$)/);
+        if (match?.[2]) return match[2].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+    }
+    return trimmed;
+}
+
+function summarizeModelError(err) {
+    const status = err.response?.status;
+    if (status) return `HTTP ${status}`;
+    if (err.code) return err.code;
+    if (err.message?.includes('quota') || err.message?.includes('429')) return 'rate_limited';
+    if (err.message?.includes('404')) return 'not_available';
+    return 'request_failed';
+}
+
+async function callOpenAIResponses(prompt, modelName) {
+    const res = await axios.post('https://api.openai.com/v1/responses', {
+        model: modelName,
+        input: [
+            { role: 'system', content: 'Return only valid JSON. No markdown, no prose outside JSON.' },
+            { role: 'user', content: prompt }
+        ],
+        text: { format: { type: 'json_object' } },
+    }, {
+        headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        timeout: API_TIMEOUT,
+    });
+    return parseJsonFromModel(res.data.output_text || res.data.output?.[0]?.content?.[0]?.text);
+}
+
+async function callOpenAIChat(prompt, modelName) {
+    const res = await axios.post('https://api.openai.com/v1/chat/completions', {
+        model: modelName,
+        messages: [
+            { role: 'system', content: 'Return only valid JSON. No markdown, no prose outside JSON.' },
+            { role: 'user', content: prompt }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.3,
+    }, {
+        headers: {
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        timeout: API_TIMEOUT,
+    });
+    return parseJsonFromModel(res.data.choices?.[0]?.message?.content);
+}
+
+async function getAIInsight(prompt) {
+    if (aiMode === 'offline') {
+        aiRuntime.lastError = 'offline_mode';
+        return null;
+    }
+    const allowOpenAI = aiMode === 'auto' || aiMode === 'openai';
+    const allowGemini = aiMode === 'auto' || aiMode === 'gemini';
+    const allowOpenRouter = aiMode === 'auto' || aiMode === 'openrouter';
+    const attempts = [];
+    const recordFailure = (provider, model, err) => {
+        const error = summarizeModelError(err);
+        attempts.push({ provider, model, ok: false, error });
+        aiRuntime.lastError = `${provider}/${model}: ${error}`;
+        if (aiMode !== 'auto' && ['HTTP 402', 'HTTP 429', 'rate_limited'].includes(error)) {
+            aiRuntime.disabledUntil = Math.max(aiRuntime.disabledUntil, Date.now() + AI_CIRCUIT_BREAKER_MS);
+        }
+    };
+    const recordSuccess = (provider, model, data) => {
+        attempts.push({ provider, model, ok: true });
+        aiRuntime = { lastProvider: provider, lastModel: model, lastError: null, disabledUntil: 0, attempts, mode: aiMode };
+        return data;
+    };
+
+    if (allowOpenAI && process.env.OPENAI_API_KEY) {
+        for (const modelName of [OPENAI_MODEL, ...OPENAI_FALLBACK_MODELS]) {
+            try {
+                return recordSuccess('OpenAI Responses', modelName, await callOpenAIResponses(prompt, modelName));
+            } catch (e) {
+                recordFailure('OpenAI Responses', modelName, e);
+                try {
+                    return recordSuccess('OpenAI Chat', modelName, await callOpenAIChat(prompt, modelName));
+                } catch (chatError) {
+                    recordFailure('OpenAI Chat', modelName, chatError);
+                }
+            }
+        }
+    }
+
+    const geminiModels = [
+        { name: "Gemini 2.0 Flash", model: "gemini-2.0-flash" },
+        { name: "Gemini 1.5 Flash", model: "gemini-1.5-flash" },
+        { name: "Gemini 1.5 Pro", model: "gemini-1.5-pro" },
     ];
-    for (const m of orModels) {
-        try {
+    if (allowGemini && genAI) {
+        for (const m of geminiModels) {
+            try {
+                const model = genAI.getGenerativeModel({ model: m.model, generationConfig: { responseMimeType: "application/json" } });
+                const result = await model.generateContent(prompt);
+                return recordSuccess('Gemini', m.model, parseJsonFromModel(result.response.text()));
+            } catch (e) {
+                recordFailure('Gemini', m.model, e);
+            }
+        }
+    }
+
+    const openRouterTokens = getOpenRouterTokens();
+    const orModels = [];
+    for (const token of openRouterTokens) {
+        for (const model of OPENROUTER_MODELS) {
+            orModels.push({ name: model, model, token });
+        }
+    }
+
+    if (allowOpenRouter) {
+        for (const m of orModels) {
+            try {
             const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
                 model: m.model,
                 messages: [{ role: "user", content: prompt + "\n\nReturn ONLY valid JSON." }],
                 temperature: 0.5,
                 max_tokens: 1500
-            }, { headers: { "Authorization": `Bearer ${m.token}`, "Content-Type": "application/json" }, timeout: API_TIMEOUT });
-            const raw = res.data.choices[0].message.content;
-            return JSON.parse(raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
-        } catch (e) {
-            console.error(`OpenRouter Model ${m.name} failed:`, e.message);
+            }, {
+                headers: {
+                    "Authorization": `Bearer ${m.token}`,
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "http://localhost:5173",
+                    "X-Title": "World Smart News Jobs Monitor",
+                },
+                timeout: API_TIMEOUT
+            });
+                return recordSuccess('OpenRouter', m.model, parseJsonFromModel(res.data.choices[0].message.content));
+            } catch (e) {
+                recordFailure('OpenRouter', m.model, e);
+            }
         }
     }
+
+    aiRuntime.attempts = attempts;
     return null;
 }
 
@@ -215,8 +563,138 @@ async function fetchBatched(urls, fetcher, batchSize = BATCH_SIZE) {
 // ═══════════════════════════════════════════════════════════════
 // JOB SCRAPING ENGINE (200+ sources)
 // ═══════════════════════════════════════════════════════════════
-const getScrapedJobs = async () => {
-    console.log(`📡 Scraping jobs from ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS feeds...`);
+function cleanText(value = '') {
+    return String(value).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function absoluteUrl(href, baseUrl) {
+    try {
+        return new URL(href, baseUrl).toString();
+    } catch (_) {
+        return href || baseUrl;
+    }
+}
+
+const NON_JOB_ANCHOR_PATTERN = /(manual|handbook|flowchart|registration|login|sign in|post new job|post international jobs|employer|recruiter|view jobs|jobs archives|job fairs|model career centers|career schemes|career information|links to govt|find domestic|find international|training by|advisories|international resources|ncs meta data|international job opportunities|privacy|terms|about us|contact us|faq|help|sitemap)/i;
+const GENERIC_NON_ROLE_PATTERN = /^(software development|content writing|consulting|business consulting|business analysis|debugging|agile development|project management|prototyping|mobile app development|web development|data management|international jobs|marketing|data entry|translation|research|training|design|testing)$/i;
+
+function isLikelyPersistableJob(job = {}) {
+    const title = cleanText(job.title || '');
+    const source = cleanText(job.source || '');
+    if (!title || title.length < 4) return false;
+    if (NON_JOB_ANCHOR_PATTERN.test(title)) return false;
+    if (GENERIC_NON_ROLE_PATTERN.test(title)) return false;
+    if (/source connected -/i.test(title)) return true;
+    if (/freelancer/i.test(source) && !/(engineer|developer|architect|analyst|specialist|consultant|manager|designer|writer|python|react|node|java|software|web|mobile|app|ai|data|cloud|security|devops|wordpress|shopify)/i.test(title)) {
+        return false;
+    }
+    if (/ncs/i.test(source) && !/(engineer|developer|analyst|manager|specialist|consultant|associate|officer|executive|assistant|trainee|intern|operator|designer|architect|scientist|teacher|nurse|technician|accountant|sales|support|data|software|cloud|security|ai|machine learning|full stack|frontend|backend)/i.test(title)) {
+        return false;
+    }
+    return true;
+}
+
+function extractJsonLdJobs(html, source) {
+    const jobs = [];
+    const scripts = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+    for (const script of scripts) {
+        const jsonText = script.replace(/^[\s\S]*?>/, '').replace(/<\/script>$/i, '').trim();
+        try {
+            const parsed = JSON.parse(jsonText);
+            const nodes = Array.isArray(parsed) ? parsed : [parsed, ...(parsed['@graph'] || [])];
+            nodes.flat().forEach((node) => {
+                if (!node || node['@type'] !== 'JobPosting') return;
+                const company = cleanText(node.hiringOrganization?.name || node.organization?.name || source.name);
+                const locationNode = Array.isArray(node.jobLocation) ? node.jobLocation[0] : node.jobLocation;
+                const location = cleanText(locationNode?.address?.addressLocality || locationNode?.address?.addressRegion || locationNode?.address?.addressCountry || source.region || 'Remote');
+                jobs.push({
+                    title: cleanText(node.title || 'Job opening'),
+                    company,
+                    location,
+                    url: node.url || source.url,
+                    isRemote: /remote/i.test(`${node.jobLocationType || ''} ${location}`),
+                    pay: cleanText(node.baseSalary?.value?.value || node.baseSalary?.value || 'N/A'),
+                    time: 'Board',
+                    source: source.name,
+                });
+            });
+        } catch (_) { }
+    }
+    return jobs;
+}
+
+function extractAnchorJobs(html, source) {
+    const jobs = [];
+    const seen = new Set();
+    const anchorRegex = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+    while ((match = anchorRegex.exec(html)) && jobs.length < 20) {
+        const href = match[1];
+        const text = cleanText(match[2]);
+        const looksLikeJob = /job|career|opening|developer|engineer|intern|software|data|cloud|remote/i.test(`${href} ${text}`);
+        if (!looksLikeJob || text.length < 8 || text.length > 140 || !isLikelyPersistableJob({ title: text, source: source.name })) continue;
+        const url = absoluteUrl(href, source.url);
+        if (seen.has(url)) continue;
+        seen.add(url);
+        jobs.push({
+            title: text,
+            company: source.name,
+            location: source.region || 'See posting',
+            url,
+            isRemote: /remote/i.test(text),
+            pay: 'N/A',
+            time: 'Board',
+            source: source.name,
+        });
+    }
+    return jobs;
+}
+
+async function getBoardSourceJobs() {
+    console.log(`Scraping ${JOB_BOARD_SOURCES.length} configured job board pages...`);
+    return fetchBatched(JOB_BOARD_SOURCES, async (source) => {
+        try {
+            const res = await axios.get(source.url, {
+                timeout: API_TIMEOUT,
+                maxRedirects: 3,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 SmartJobMonitor/3.0',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+                validateStatus: status => status >= 200 && status < 500,
+            });
+            if (res.status >= 400 || typeof res.data !== 'string') {
+                return [{
+                    title: `${source.name} source connected - blocked or requires auth`,
+                    company: source.name,
+                    location: source.region || 'Source',
+                    url: source.url,
+                    isRemote: false,
+                    pay: 'N/A',
+                    time: `HTTP ${res.status}`,
+                    source: `${source.name} Monitor`,
+                }];
+            }
+            const jsonLdJobs = extractJsonLdJobs(res.data, source);
+            const anchorJobs = jsonLdJobs.length ? [] : extractAnchorJobs(res.data, source);
+            return [...jsonLdJobs, ...anchorJobs].slice(0, 25);
+        } catch (e) {
+            return [{
+                title: `${source.name} source connected - fetch failed`,
+                company: source.name,
+                location: source.region || 'Source',
+                url: source.url,
+                isRemote: false,
+                pay: 'N/A',
+                time: 'Source check',
+                source: `${source.name} Monitor`,
+            }];
+        }
+    }, 4);
+}
+
+const getScrapedJobs = async (refreshRunId = null) => {
+    console.log(`📡 Scraping jobs from ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS feeds + ${JOB_BOARD_SOURCES.length} board scrapers...`);
     const jobs = [];
 
     // 1. Fetch from APIs
@@ -262,7 +740,8 @@ const getScrapedJobs = async () => {
         } catch (e) { return []; }
     });
 
-    const allRawJobs = [...apiJobs, ...rssJobs];
+    const boardJobs = await getBoardSourceJobs();
+    const allRawJobs = [...apiJobs, ...rssJobs, ...boardJobs];
 
     // Deduplicate by URL
     const seen = new Set();
@@ -285,20 +764,23 @@ const getScrapedJobs = async () => {
             lng: hub.lng + (Math.random() - 0.5) * 0.08,
             company: j.company, title: j.title, location: j.location,
             url: j.url, isRemote: j.isRemote, time: j.time,
+            source: j.source,
+            collectedAt: Date.now(),
+            refreshRunId,
             size: 0.4, color: "#00e676"
         });
     });
 
     // Save to Neon DB
-    await saveJobsToNeonDB(uniqueJobs);
-    console.log(`✅ Jobs scraped: ${jobs.length} unique from ${JOB_APIS.length + JOB_RSS_FEEDS.length} sources`);
+    await saveJobsToNeonDB(uniqueJobs, refreshRunId);
+    console.log(`✅ Jobs scraped: ${jobs.length} unique from ${getTotalJobSources()} sources`);
     return jobs;
 };
 
 // ═══════════════════════════════════════════════════════════════
 // NEWS SCRAPING ENGINE (1000+ sources)
 // ═══════════════════════════════════════════════════════════════
-const getScrapedNews = async () => {
+const getScrapedNews = async (refreshRunId = null) => {
     console.log(`📡 Scraping news from ${NEWS_RSS_FEEDS.length} RSS + ${HN_QUERIES.length} HN queries...`);
     const news = [];
 
@@ -331,8 +813,9 @@ const getScrapedNews = async () => {
     });
 
     const allRawNews = [...hnNews, ...rssNews];
+    const candidateNews = allRawNews.filter(n => isRecentDate(n.date));
     const seen = new Set();
-    const uniqueNews = allRawNews.filter(n => {
+    const uniqueNews = sortByDateDesc(candidateNews).filter(n => {
         if (!n.url || seen.has(n.url)) return false;
         seen.add(n.url);
         return true;
@@ -349,12 +832,12 @@ const getScrapedNews = async () => {
             lat: hub.lat + (Math.random() - 0.5) * 0.1,
             lng: hub.lng + (Math.random() - 0.5) * 0.1,
             headline: n.headline, source: n.source, url: n.url,
-            time: "🔴 LIVE", radius: 4.5, color: "#ff3333"
+            time: "🔴 LIVE", collectedAt: Date.now(), refreshRunId, radius: 4.5, color: "#ff3333"
         });
     });
 
     // Save to DB
-    await saveNewsToNeonDB(uniqueNews);
+    await saveNewsToNeonDB(uniqueNews, refreshRunId);
     console.log(`✅ News scraped: ${news.length} unique from ${NEWS_RSS_FEEDS.length + HN_QUERIES.length} sources`);
     return news;
 };
@@ -409,12 +892,26 @@ const getLatestTrends = async () => {
     });
 
     trends.push(...rssTrends);
-    return trends.sort(() => Math.random() - 0.5);
+    const recentTrends = trends.filter(item => isRecentDate(item.date));
+    return sortByDateDesc(recentTrends);
 };
 
 // ═══════════════════════════════════════════════════════════════
 // YOUTUBE VIDEOS (Multi-Source Scraping)
 // ═══════════════════════════════════════════════════════════════
+const YOUTUBE_FRESH_QUERIES = [
+    "AI news today",
+    "artificial intelligence news last 24 hours",
+    "OpenAI news today",
+    "Google Gemini AI news today",
+    "NVIDIA AI news today",
+    "startup funding news today",
+    "technology news today",
+    "cybersecurity news today",
+    "software engineering news today",
+    "cloud computing news today",
+];
+
 const YOUTUBE_BASE_QUERIES = [
     // AI & MACHINE LEARNING (The Heart)
     "artificial intelligence news today", "machine learning tutorial 2026", "large language model LLM news",
@@ -480,6 +977,45 @@ const YOUTUBE_BASE_QUERIES = [
     "privacy coins zkp tech", "blockchain interoperability bridge"
 ];
 
+function parseYouTubeAgeDays(ago = '') {
+    const text = String(ago || '').toLowerCase();
+    if (!text) return 999;
+    if (/second|minute|hour|today|just now/.test(text)) return 0;
+    const amount = Number((text.match(/(\d+)/) || [])[1] || (text.includes('a ') || text.includes('an ') ? 1 : 0));
+    if (/day/.test(text)) return amount || 1;
+    if (/week/.test(text)) return (amount || 1) * 7;
+    if (/month/.test(text)) return (amount || 1) * 30;
+    if (/year/.test(text)) return (amount || 1) * 365;
+    return 999;
+}
+
+function normalizeYouTubeVideo(v, query) {
+    const ageDays = parseYouTubeAgeDays(v.ago);
+    const refreshed = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    return {
+        title: v.title,
+        videoId: v.videoId,
+        channel: v.author?.name || 'YouTube',
+        views: Number(v.views || 0),
+        ago: v.ago || 'recent',
+        published: `${v.ago || 'recent'} • refreshed ${refreshed}`,
+        publishedAgeDays: ageDays,
+        category: query.includes('AI') || query.includes('ai') || query.includes('machine') ? 'ai' :
+            query.includes('startup') || query.includes('funding') ? 'startup' :
+                query.includes('cyber') || query.includes('hacking') ? 'security' :
+                    query.includes('cloud') || query.includes('devops') ? 'cloud' :
+                        query.includes('robot') || query.includes('quantum') ? 'hardware' :
+                            query.includes('blockchain') || query.includes('web3') ? 'web3' : 'tech'
+    };
+}
+
+function withTimeout(promise, ms, fallback) {
+    return Promise.race([
+        promise,
+        new Promise(resolve => setTimeout(() => resolve(fallback), ms)),
+    ]);
+}
+
 const getYouTubeVideos = async () => {
     // Combine base queries with AI-generated trending queries
     let aiQueries = [];
@@ -488,73 +1024,119 @@ const getYouTubeVideos = async () => {
         if (aiRes?.queries?.length) aiQueries = aiRes.queries;
     } catch (e) { }
 
-    const allQueries = [...YOUTUBE_BASE_QUERIES, ...aiQueries];
+    const allQueries = [...aiQueries, ...YOUTUBE_FRESH_QUERIES, ...YOUTUBE_BASE_QUERIES].slice(0, YOUTUBE_QUERY_LIMIT);
     console.log(`🎥 Scraping YouTube with ${allQueries.length} queries...`);
 
     const videos = [];
+    const overflowVideos = [];
     const uniqueIds = new Set();
 
     const fetchVideos = await fetchBatched(allQueries, async (query) => {
         try {
-            const r = await ytSearch(query);
-            return (r.videos || []).slice(0, 8).map(v => ({
-                title: v.title, videoId: v.videoId,
-                channel: v.author?.name || 'YouTube',
-                views: v.views || 0,
-                published: `🔴 LIVE • ${new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`,
-                category: query.includes('AI') || query.includes('machine') ? 'ai' :
-                    query.includes('startup') || query.includes('funding') ? 'startup' :
-                        query.includes('cyber') || query.includes('hacking') ? 'security' :
-                            query.includes('cloud') || query.includes('devops') ? 'cloud' :
-                                query.includes('robot') || query.includes('quantum') ? 'hardware' :
-                                    query.includes('blockchain') || query.includes('web3') ? 'web3' : 'tech'
-            }));
+            const r = await withTimeout(ytSearch(query), API_TIMEOUT, { videos: [] });
+            return (r.videos || []).slice(0, 10).map(v => normalizeYouTubeVideo(v, query));
         } catch (e) { return []; }
     }, 5); // batch 5 at a time to avoid rate limits
 
     fetchVideos.forEach(v => {
         if (v.videoId && !uniqueIds.has(v.videoId)) {
             uniqueIds.add(v.videoId);
-            videos.push(v);
+            if (v.publishedAgeDays <= VIDEO_MAX_AGE_DAYS) videos.push(v);
+            else overflowVideos.push(v);
         }
     });
 
-    await saveVideosToNeonDB(videos);
-    console.log(`✅ YouTube: ${videos.length} unique videos from ${allQueries.length} queries`);
-    return videos.sort(() => Math.random() - 0.5).slice(0, 60);
+    const selectedVideos = (videos.length >= 12 ? videos : [...videos, ...overflowVideos])
+        .sort((a, b) => (a.publishedAgeDays - b.publishedAgeDays) || ((b.views || 0) - (a.views || 0)))
+        .slice(0, 60);
+    await saveVideosToNeonDB(selectedVideos);
+    console.log(`✅ YouTube: ${selectedVideos.length} fresh videos from ${allQueries.length} queries`);
+    return selectedVideos;
 };
 
 // ═══════════════════════════════════════════════════════════════
 // DATABASE SAVE FUNCTIONS
 // ═══════════════════════════════════════════════════════════════
-const saveJobsToNeonDB = async (jobsArr) => {
+async function cleanupKnownJobNoise() {
+    if (!pool) return;
+    try {
+        await pool.query(`
+            DELETE FROM jobs
+            WHERE LOWER(COALESCE(source, '')) LIKE '%ncs%'
+              AND LOWER(COALESCE(title, '')) ~ '(manual|handbook|flowchart|registration|post new job|view jobs|jobs archives|job fairs|model career centers|career schemes|career information|links to govt|find domestic|find international|training by)';
+        `);
+        await pool.query(`
+            DELETE FROM jobs
+            WHERE LOWER(TRIM(COALESCE(title, ''))) IN ('software development','content writing','consulting','business consulting','business analysis','debugging','agile development','project management','prototyping','mobile app development','web development','data management','international jobs','marketing','data entry','translation','research','training','design','testing','advisories for international jobseeker','international resources','post international jobs','ncs meta data','international job opportunities');
+        `);
+        await pool.query(`
+            DELETE FROM jobs older
+            USING jobs newer
+            WHERE older.id < newer.id
+              AND LOWER(TRIM(COALESCE(older.title, ''))) = LOWER(TRIM(COALESCE(newer.title, '')))
+              AND LOWER(TRIM(COALESCE(older.company, ''))) = LOWER(TRIM(COALESCE(newer.company, '')))
+              AND LOWER(TRIM(COALESCE(older.source, ''))) = LOWER(TRIM(COALESCE(newer.source, '')))
+              AND LOWER(TRIM(COALESCE(older.location, ''))) = LOWER(TRIM(COALESCE(newer.location, '')));
+        `);
+    } catch (e) {
+        console.error('Job cleanup error:', e.message);
+    }
+}
+
+const saveJobsToNeonDB = async (jobsArr, refreshRunId = null) => {
     if (!pool || jobsArr.length === 0) return;
+    jobsArr = jobsArr.filter(isLikelyPersistableJob);
+    if (jobsArr.length === 0) return;
     // Insert in chunks of 50
     for (let i = 0; i < jobsArr.length; i += 50) {
         const chunk = jobsArr.slice(i, i + 50);
         const values = []; const placeholders = []; let c = 1;
         for (const j of chunk) {
-            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},'NEW')`);
-            values.push(j.title, j.company, j.url, j.source || j.time, j.location || 'Remote', j.pay || 'N/A', new Date().toISOString());
+            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},'open',NOW(),$${c++})`);
+            values.push(j.title, j.company, j.url, j.source || j.time, j.location || 'Remote', j.pay || 'N/A', new Date().toISOString(), refreshRunId);
         }
         try {
-            await pool.query(`INSERT INTO jobs (title,company,url,source,location,pay,posted_date,status) VALUES ${placeholders.join(',')} ON CONFLICT (url) DO NOTHING;`, values);
+            await pool.query(`
+                INSERT INTO jobs (title,company,url,source,location,pay,posted_date,status,refreshed_at,refresh_run_id)
+                VALUES ${placeholders.join(',')}
+                ON CONFLICT (url) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    company = EXCLUDED.company,
+                    source = EXCLUDED.source,
+                    location = EXCLUDED.location,
+                    pay = EXCLUDED.pay,
+                    posted_date = EXCLUDED.posted_date,
+                    refreshed_at = NOW(),
+                    refresh_run_id = EXCLUDED.refresh_run_id;
+            `, values);
         } catch (e) { console.error('💾 DB insert error:', e.message); }
     }
+    await cleanupKnownJobNoise();
     console.log(`💾 Saved ${jobsArr.length} jobs to Neon DB`);
 };
 
-const saveNewsToNeonDB = async (newsArr) => {
+const saveNewsToNeonDB = async (newsArr, refreshRunId = null) => {
     if (!pool || newsArr.length === 0) return;
     for (let i = 0; i < newsArr.length; i += 50) {
         const chunk = newsArr.slice(i, i + 50);
         const values = []; const placeholders = []; let c = 1;
         for (const n of chunk) {
-            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++})`);
-            values.push(n.headline, n.source, n.url, n.category || 'tech', n.snippet || '', n.date || new Date().toISOString());
+            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},NOW(),$${c++})`);
+            values.push(n.headline, n.source, n.url, n.category || 'tech', n.snippet || '', n.date || new Date().toISOString(), refreshRunId);
         }
         try {
-            await pool.query(`INSERT INTO news (headline,source,url,category,snippet,published_date) VALUES ${placeholders.join(',')} ON CONFLICT (url) DO NOTHING;`, values);
+            await pool.query(`
+                INSERT INTO news (headline,source,url,category,snippet,published_date,refreshed_at,refresh_run_id)
+                VALUES ${placeholders.join(',')}
+                ON CONFLICT (url) DO UPDATE SET
+                    headline = EXCLUDED.headline,
+                    source = EXCLUDED.source,
+                    category = EXCLUDED.category,
+                    snippet = EXCLUDED.snippet,
+                    published_date = EXCLUDED.published_date,
+                    refreshed_at = NOW(),
+                    refresh_run_id = EXCLUDED.refresh_run_id;
+            `, values);
         } catch (e) { /* skip */ }
     }
 };
@@ -563,75 +1145,383 @@ const saveVideosToNeonDB = async (vids) => {
     if (!pool || vids.length === 0) return;
     const values = []; const placeholders = []; let c = 1;
     for (const v of vids) {
-        placeholders.push(`($${c++},$${c++},$${c++},$${c++})`);
-        values.push(v.title, v.videoId, v.channel, v.published);
+        placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++})`);
+        values.push(v.title, v.videoId, v.channel, v.published, Number(v.views || 0), v.ago || v.published || 'recent');
     }
     try {
-        await pool.query(`INSERT INTO youtube_videos (title,video_id,channel,published) VALUES ${placeholders.join(',')} ON CONFLICT (video_id) DO NOTHING;`, values);
+        await pool.query(`
+            INSERT INTO youtube_videos (title,video_id,channel,published,views,published_ago)
+            VALUES ${placeholders.join(',')}
+            ON CONFLICT (video_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                channel = EXCLUDED.channel,
+                published = EXCLUDED.published,
+                views = EXCLUDED.views,
+                published_ago = EXCLUDED.published_ago,
+                refreshed_at = NOW();
+        `, values);
     } catch (e) { /* skip */ }
 };
+
+// Smart Job Portal helpers
+const CRM_STATUSES = new Set(['open', 'new', 'queued', 'applied', 'interview', 'offer', 'rejected', 'archived']);
+const TECH_KEYWORDS = [
+    'python', 'javascript', 'typescript', 'react', 'node', 'java', 'go', 'rust', 'sql', 'postgres',
+    'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'terraform', 'ai', 'ml', 'llm', 'rag',
+    'data', 'security', 'devops', 'backend', 'frontend', 'fullstack', 'cloud', 'linux',
+];
+const SQL_CLEAN = (column) => `TRIM(REGEXP_REPLACE(COALESCE(${column}, ''), '[[:space:]]+', ' ', 'g'))`;
+
+function normalizeJobStatus(status = 'open') {
+    const normalized = String(status).toLowerCase().trim();
+    if (normalized === 'new' || normalized === 'queued') return 'open';
+    return CRM_STATUSES.has(normalized) ? normalized : 'open';
+}
+
+function tokenizeText(text = '') {
+    return String(text).toLowerCase().match(/[a-z0-9+#.]{2,}/g) || [];
+}
+
+function scoreJobAgainstResume(resumeText = '', job = {}) {
+    const resumeTokens = new Set(tokenizeText(resumeText));
+    const jobText = [job.title, job.company, job.location, job.source, job.pay].filter(Boolean).join(' ');
+    const jobTokens = [...new Set(tokenizeText(jobText))];
+    if (!resumeTokens.size || !jobTokens.length) return 0;
+    const overlap = jobTokens.filter(token => resumeTokens.has(token)).length;
+    const techBoost = TECH_KEYWORDS.filter(token => resumeTokens.has(token) && jobTokens.includes(token)).length * 4;
+    const base = Math.round((overlap / Math.max(jobTokens.length, 1)) * 100);
+    return Math.min(99, Math.max(1, base + techBoost));
+}
+
+function classifySeniority(title = '') {
+    const text = title.toLowerCase();
+    if (/principal|staff|lead|architect|head/.test(text)) return 'lead';
+    if (/senior|sr\.?/.test(text)) return 'senior';
+    if (/junior|jr\.?|entry|graduate|intern/.test(text)) return 'early';
+    return 'mid';
+}
+
+function classifyWorkMode(location = '') {
+    const text = location.toLowerCase();
+    if (/remote|anywhere|worldwide|global/.test(text)) return 'remote';
+    if (/hybrid/.test(text)) return 'hybrid';
+    return 'onsite';
+}
+
+function buildJobPromptContext(job = {}) {
+    return `Title: ${job.title || 'Role'}
+Company: ${job.company || 'Company'}
+Location: ${job.location || 'Remote'}
+Pay: ${job.pay || 'Not listed'}
+Source: ${job.source || 'Unknown'}
+URL: ${job.url || 'N/A'}`;
+}
+
+function fallbackCareerText(type, job = {}, resumeText = '') {
+    const title = job.title || 'this role';
+    const company = job.company || 'the company';
+    const keywords = TECH_KEYWORDS.filter(k => `${resumeText} ${title} ${job.source || ''}`.toLowerCase().includes(k)).slice(0, 6);
+    if (type === 'cover-letter') {
+        return `Dear Hiring Team,\n\nI am excited to apply for ${title} at ${company}. My background aligns with the role's focus on ${keywords.join(', ') || 'building reliable software and solving practical business problems'}. I bring a strong bias for ownership, clear communication, and production-quality execution.\n\nI would welcome the opportunity to discuss how I can contribute to your team.\n\nSincerely,`;
+    }
+    if (type === 'interview-prep') {
+        return `1. Why are you interested in ${company} and this ${title} role?\n2. Walk through a production system you built or improved that relates to this role.\n3. Describe a tradeoff you made between speed, reliability, and maintainability.\n\nAnswer strategy: connect your experience to the role, quantify impact, and prepare one technical deep dive.`;
+    }
+    if (type === 'cold-message') {
+        return `Hi, I saw the ${title} opening at ${company} and it strongly matches my background. I would be grateful to connect and learn what the team is prioritizing for this role.`;
+    }
+    if (type === 'skill-gap') {
+        const missing = TECH_KEYWORDS.filter(k => !resumeText.toLowerCase().includes(k) && `${title} ${job.source || ''}`.toLowerCase().includes(k)).slice(0, 5);
+        return `Likely skill gaps: ${missing.join(', ') || 'no obvious keyword gaps from the available job metadata'}.\n\nRecommended path: add measurable project bullets, mirror the role's core keywords, and prepare one story showing impact in a similar environment.`;
+    }
+    return 'AI provider is cooling down. The deterministic career assistant is still available.';
+}
+
+const ROLE_FAMILIES = [
+    ['ai/ml', /(ai|machine learning|ml|llm|rag|nlp|computer vision|data scientist|deep learning)/i],
+    ['frontend', /(frontend|front-end|react|vue|angular|ui engineer|web developer)/i],
+    ['backend', /(backend|back-end|node|java|spring|api|microservice|server)/i],
+    ['fullstack', /(full[ -]?stack|mern|mean|full stack)/i],
+    ['data', /(data engineer|analytics|etl|bi|warehouse|spark|sql)/i],
+    ['devops/cloud', /(devops|sre|cloud|aws|azure|gcp|kubernetes|docker|platform engineer)/i],
+    ['security', /(security|cyber|soc|iam|penetration|appsec|devsecops)/i],
+    ['product/design', /(product manager|designer|ux|ui\/ux|figma|product owner)/i],
+    ['qa/testing', /(qa|test engineer|automation testing|sdet|quality)/i],
+];
+
+function classifyRoleFamily(title = '') {
+    const match = ROLE_FAMILIES.find(([, pattern]) => pattern.test(title));
+    return match ? match[0] : 'general software';
+}
+
+function extractResumeProfile(resumeText = '') {
+    const text = String(resumeText || '').toLowerCase();
+    const skills = TECH_KEYWORDS.filter(skill => text.includes(skill));
+    const roleSignals = ROLE_FAMILIES
+        .filter(([, pattern]) => pattern.test(text))
+        .map(([label]) => label);
+    const yearMatch = text.match(/(\d{1,2})\+?\s*(years|yrs|year)/);
+    return {
+        skills,
+        roleSignals: roleSignals.length ? [...new Set(roleSignals)] : ['general software'],
+        seniority: /principal|staff|architect|lead|manager/.test(text) ? 'lead' : /senior|sr\.?/.test(text) || Number(yearMatch?.[1] || 0) >= 5 ? 'senior' : /intern|junior|entry|fresher/.test(text) ? 'early' : 'mid',
+        years: yearMatch ? Number(yearMatch[1]) : null,
+        keywords: [...new Set(tokenizeText(resumeText).filter(token => token.length > 2))].slice(0, 80),
+    };
+}
+
+function scoreJobForRag(job = {}, profile = {}, query = '') {
+    const jobText = `${job.title || ''} ${job.company || ''} ${job.location || ''} ${job.source || ''} ${job.pay || ''}`.toLowerCase();
+    const queryTokens = new Set(tokenizeText(query));
+    const skillHits = (profile.skills || []).filter(skill => jobText.includes(skill));
+    const queryHits = [...queryTokens].filter(token => jobText.includes(token));
+    const roleHit = (profile.roleSignals || []).some(role => classifyRoleFamily(job.title || '') === role);
+    const seniorityHit = classifySeniority(job.title || '') === profile.seniority;
+    const remoteBoost = /remote|hybrid/i.test(job.location || '') ? 4 : 0;
+    return (skillHits.length * 9) + (queryHits.length * 5) + (roleHit ? 12 : 0) + (seniorityHit ? 5 : 0) + remoteBoost;
+}
+
+function summarizeRows(rows = []) {
+    const countBy = (fn, limit = 8) => {
+        const map = new Map();
+        rows.forEach(row => {
+            const key = fn(row) || 'Unknown';
+            map.set(key, (map.get(key) || 0) + 1);
+        });
+        return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([label, count]) => ({ label, count }));
+    };
+    return {
+        companies: countBy(row => row.company, 10),
+        sources: countBy(row => row.source, 10),
+        locations: countBy(row => row.location, 10),
+        roleFamilies: countBy(row => classifyRoleFamily(row.title), 10),
+        seniority: countBy(row => classifySeniority(row.title), 6),
+        workModes: countBy(row => classifyWorkMode(row.location), 4),
+    };
+}
+
+async function retrieveJobsForRag({ resumeText = '', question = '', limit = 24, sampleLimit = 1600 } = {}) {
+    if (!pool) return { profile: extractResumeProfile(resumeText), jobs: [], analytics: summarizeRows([]) };
+    const profile = extractResumeProfile(resumeText);
+    const jobsRes = await pool.query(
+        `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, url, source,
+                ${SQL_CLEAN('location')} AS location, pay, posted_date, status, notes, match_score, created_at
+             FROM jobs
+             WHERE LOWER(COALESCE(status, 'open')) NOT IN ('archived', 'rejected')
+         ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC
+         LIMIT $1`,
+        [sampleLimit]
+    );
+    const scored = jobsRes.rows
+        .map(job => ({
+            ...job,
+            match_score: Math.max(scoreJobAgainstResume(resumeText, job), scoreJobForRag(job, profile, question)),
+            role_family: classifyRoleFamily(job.title),
+            seniority: classifySeniority(job.title),
+            work_mode: classifyWorkMode(job.location),
+        }))
+        .sort((a, b) => b.match_score - a.match_score);
+    return {
+        profile,
+        jobs: scored.slice(0, limit),
+        analytics: summarizeRows(scored.slice(0, 250)),
+        sampleSize: jobsRes.rows.length,
+    };
+}
+
+function buildAgenticResumeReport(resumeText = '', retrieved = {}) {
+    const profile = retrieved.profile || extractResumeProfile(resumeText);
+    const jobs = retrieved.jobs || [];
+    const topSkills = profile.skills.slice(0, 12);
+    const marketSkills = [...new Set(jobs.flatMap(job => TECH_KEYWORDS.filter(skill => `${job.title} ${job.source}`.toLowerCase().includes(skill))))];
+    const missingSkills = marketSkills.filter(skill => !profile.skills.includes(skill)).slice(0, 10);
+    const companies = [...new Set(jobs.map(job => job.company).filter(Boolean))].slice(0, 10);
+    const targetRoles = [...new Set(jobs.map(job => job.role_family).filter(Boolean))].slice(0, 6);
+    return {
+        summary: `Profile reads as ${profile.seniority} level with focus on ${profile.roleSignals.join(', ')}. Retrieved ${jobs.length} strong job matches from ${retrieved.sampleSize || jobs.length} live roles.`,
+        profile,
+        topSkills,
+        missingSkills,
+        targetRoles,
+        companies,
+        actions: [
+            `Tune resume headline toward: ${targetRoles.slice(0, 3).join(', ') || 'software engineering'}.`,
+            `Add measurable bullets for: ${(topSkills.length ? topSkills : profile.keywords.slice(0, 5)).join(', ') || 'core project impact'}.`,
+            `Build or highlight proof for missing market skills: ${missingSkills.slice(0, 5).join(', ') || 'no obvious critical gaps'}.`,
+            `Apply first to: ${companies.slice(0, 5).join(', ') || 'the highest match companies shown below'}.`,
+        ],
+        evidence: jobs.slice(0, 8).map(job => `${job.match_score}% ${job.title} @ ${job.company} (${job.location || 'Remote'})`),
+    };
+}
+
+function formatAgenticReport(report = {}, jobs = []) {
+    return [
+        `Agentic RAG Resume Report`,
+        ``,
+        `Summary: ${report.summary || 'Resume analyzed against the live jobs database.'}`,
+        ``,
+        `Target roles: ${(report.targetRoles || []).join(', ') || 'Not enough signal yet'}`,
+        `Matched skills: ${(report.topSkills || []).join(', ') || 'No strong explicit skill signals found'}`,
+        `Skill gaps: ${(report.missingSkills || []).join(', ') || 'No critical gaps detected from retrieved jobs'}`,
+        ``,
+        `Recommended actions:`,
+        ...(report.actions || []).map(item => `- ${item}`),
+        ``,
+        `Evidence from retrieved jobs:`,
+        ...(report.evidence || jobs.slice(0, 8).map(job => `${job.match_score}% ${job.title} @ ${job.company}`)).map(item => `- ${item}`),
+    ].join('\n');
+}
+
+function formatMarketAnswer(question = '', retrieved = {}) {
+    const jobs = retrieved.jobs || [];
+    const analytics = retrieved.analytics || summarizeRows(jobs);
+    const companies = analytics.companies.map(item => `${item.label} (${item.count})`).join(', ') || 'No dominant companies';
+    const sources = analytics.sources.map(item => `${item.label} (${item.count})`).join(', ') || 'No dominant sources';
+    const roles = analytics.roleFamilies.map(item => `${item.label} (${item.count})`).join(', ') || 'No clear role cluster';
+    const locations = analytics.locations.map(item => `${item.label} (${item.count})`).join(', ') || 'No clear location cluster';
+    const topJobs = jobs.slice(0, 8).map(job => `- ${job.match_score}% ${job.title} @ ${job.company} (${job.location || 'Remote'}) [${job.source || 'source'}]`).join('\n');
+    return `Agentic RAG market answer\n\nQuestion: ${question}\n\nRetrieved ${jobs.length} relevant jobs from ${retrieved.sampleSize || jobs.length} live rows.\n\nRole clusters: ${roles}\nCompanies: ${companies}\nLocations: ${locations}\nSources: ${sources}\n\nTop evidence:\n${topJobs || '- No evidence rows found. Try a skill, role, company, or location keyword.'}`;
+}
+
+function fallbackToolkitAgentic(type, job = {}, resumeText = '', retrieved = {}) {
+    const report = buildAgenticResumeReport(resumeText, retrieved);
+    const evidence = (retrieved.jobs || []).slice(0, 5).map(item => `- ${item.match_score}% ${item.title} @ ${item.company}`).join('\n');
+    if (type === 'resume-summary') {
+        return `Resume positioning summary\n\nTarget: ${job.title || 'selected role'} at ${job.company || 'the company'}\n\n${report.summary}\n\nStrong signals: ${(report.topSkills || []).join(', ') || 'project execution and delivery'}\nGaps to cover: ${(report.missingSkills || []).slice(0, 6).join(', ') || 'no obvious gaps'}\n\nEvidence:\n${evidence}`;
+    }
+    if (type === 'recruiter-email') {
+        return `Subject: Interest in ${job.title || 'the role'}\n\nHi,\n\nI found the ${job.title || 'open'} role at ${job.company || 'your company'} and it closely matches my background in ${(report.topSkills || []).slice(0, 5).join(', ') || 'software delivery'}.\n\nA few relevant signals from my profile: ${report.summary}\n\nI would appreciate the chance to discuss how I can contribute to this team.\n\nBest,`;
+    }
+    return `${fallbackCareerText(type, job, resumeText)}\n\nRAG evidence:\n${evidence || '- No adjacent evidence available.'}\n\nNext actions:\n${(report.actions || []).map(item => `- ${item}`).join('\n')}`;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CACHE + AUTO-REFRESH
 // ═══════════════════════════════════════════════════════════════
-let cache = { dashboardData: null, videos: [], trends: [], lastRefresh: 0, stats: {} };
+let cache = {
+    dashboardData: null,
+    videos: [],
+    videoLastRefresh: 0,
+    videoLastStarted: 0,
+    trends: [],
+    lastRefresh: 0,
+    lastStarted: 0,
+    lastError: null,
+    refreshCount: 0,
+    lastRefreshRunId: null,
+    stats: {},
+};
 let isRefreshing = false;
+let isVideoRefreshing = false;
+let videoRefreshPromise = null;
+const REFRESH_RESPONSE_WAIT_MS = Number(process.env.REFRESH_RESPONSE_WAIT_MS || 45000);
+
+function makeRefreshRunId() {
+    return `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function refreshVideosIfNeeded(force = false) {
+    const stale = !cache.videoLastRefresh || (Date.now() - cache.videoLastRefresh > VIDEO_REFRESH_INTERVAL_MS);
+    if (!force && !stale && cache.videos?.length) return cache.videos;
+    if (isVideoRefreshing) return force && videoRefreshPromise ? await videoRefreshPromise : (cache.videos || []);
+    isVideoRefreshing = true;
+    cache.videoLastStarted = Date.now();
+    videoRefreshPromise = (async () => {
+        const freshVideos = await getYouTubeVideos();
+        if (freshVideos?.length) {
+            cache.videos = freshVideos;
+            cache.videoLastRefresh = Date.now();
+        }
+        return cache.videos || [];
+    })();
+    try {
+        return await videoRefreshPromise;
+    } catch (e) {
+        console.error("Video refresh error:", e.message);
+        return cache.videos || [];
+    } finally {
+        isVideoRefreshing = false;
+        videoRefreshPromise = null;
+    }
+}
 
 async function refreshAllData() {
     if (isRefreshing) return;
     isRefreshing = true;
+    cache.lastStarted = Date.now();
+    const refreshRunId = makeRefreshRunId();
+    cache.lastRefreshRunId = refreshRunId;
     console.log(`\n🔄 [${new Date().toLocaleTimeString()}] Starting background data refresh...`);
 
     try {
         // Pre-load from DB if cache is empty to avoid blank UI
-        if (!cache.dashboardData) {
+        if (!cache.dashboardData && pool) {
             console.log("💾 Loading initial data from Database...");
             const [dbJobs, dbNews, dbVids] = await Promise.all([
-                pool.query('SELECT * FROM jobs ORDER BY posted_date DESC LIMIT 500'),
-                pool.query('SELECT * FROM news ORDER BY published_date DESC LIMIT 500'),
-                pool.query('SELECT * FROM youtube_videos ORDER BY id DESC LIMIT 60')
+                pool.query('SELECT * FROM jobs ORDER BY COALESCE(refreshed_at, created_at) DESC LIMIT 500'),
+                pool.query('SELECT * FROM news ORDER BY COALESCE(refreshed_at, created_at) DESC LIMIT 500'),
+                pool.query('SELECT * FROM youtube_videos ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC LIMIT 60')
             ]);
 
             if (dbJobs.rows.length > 0 || dbNews.rows.length > 0) {
-                const jobs = dbJobs.rows.map(j => ({ ...j, type: 'job' }));
-                const news = dbNews.rows.map(n => ({ ...n, type: 'news' }));
+                const jobs = dbJobs.rows.map(toJobPoint);
+                const news = dbNews.rows.map(toNewsPoint);
                 cache.dashboardData = [...jobs, ...news];
                 cache.videos = dbVids.rows;
+                cache.videoLastRefresh = dbVids.rows[0]?.refreshed_at ? new Date(dbVids.rows[0].refreshed_at).getTime() : cache.videoLastRefresh;
                 console.log(`✅ Pre-loaded ${cache.dashboardData.length} items from DB`);
             }
         }
 
         // Run fresh scraping in parallel
         const scrapeMainData = async () => {
-            const [jobs, news] = await Promise.all([getScrapedJobs(), getScrapedNews()]);
-            cache.dashboardData = [...jobs, ...news].sort(() => Math.random() - 0.5);
+            const [jobs, news] = await Promise.all([getScrapedJobs(refreshRunId), getScrapedNews(refreshRunId)]);
+            cache.dashboardData = [...jobs, ...news].sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0));
             return { jobs, news };
         };
 
         const scrapeSecondaryData = async () => {
-            const [videos, trends] = await Promise.all([getYouTubeVideos(), getLatestTrends()]);
+            const [videos, trends] = await Promise.all([refreshVideosIfNeeded(true), getLatestTrends()]);
             if (videos?.length) cache.videos = videos;
             if (trends?.length) cache.trends = trends;
             return { videos, trends };
         };
 
-        const [{ jobs, news }, { videos, trends }] = await Promise.all([
-            scrapeMainData(),
-            scrapeSecondaryData()
-        ]);
+        const secondaryPromise = scrapeSecondaryData().catch(e => {
+            console.error("Secondary refresh error:", e.message);
+            return { videos: cache.videos, trends: cache.trends };
+        });
+        const { jobs, news } = await scrapeMainData();
 
         cache.lastRefresh = Date.now();
         cache.stats = {
             totalJobs: jobs.length,
             totalNews: news.length,
-            totalVideos: (videos || []).length,
-            totalTrends: (trends || []).length,
-            jobSources: JOB_APIS.length + JOB_RSS_FEEDS.length,
+            totalVideos: cache.videos.length,
+            totalTrends: cache.trends.length,
+            jobSources: getTotalJobSources(),
             newsSources: NEWS_RSS_FEEDS.length + HN_QUERIES.length,
+            modelProvider: aiRuntime.lastProvider,
+            modelName: aiRuntime.lastModel,
+            dbConnected: Boolean(pool),
+            lastRefreshISO: new Date(cache.lastRefresh).toISOString(),
+            refreshRunId,
         };
+        cache.refreshCount += 1;
+        cache.lastError = null;
+        secondaryPromise.then(({ videos, trends }) => {
+            cache.stats.totalVideos = (videos || cache.videos || []).length;
+            cache.stats.totalTrends = (trends || cache.trends || []).length;
+            console.log(`Secondary cache updated: ${cache.stats.totalVideos} videos, ${cache.stats.totalTrends} trends`);
+        });
         console.log(`✅ CACHE UPDATED: ${jobs.length} jobs, ${news.length} news, ${cache.videos.length} videos`);
     } catch (e) {
         console.error("❌ Refresh error:", e.message);
+        cache.lastError = e.message;
     } finally {
         isRefreshing = false;
     }
@@ -640,30 +1530,177 @@ async function refreshAllData() {
 // ═══════════════════════════════════════════════════════════════
 // API ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
+function getServiceHealth() {
+    const ageMs = cache.lastRefresh ? Date.now() - cache.lastRefresh : null;
+    return {
+        ok: !cache.lastError,
+        isRefreshing,
+        dbConnected: Boolean(pool),
+        lastRefresh: cache.lastRefresh,
+        lastRefreshISO: cache.lastRefresh ? new Date(cache.lastRefresh).toISOString() : null,
+        refreshRunId: cache.lastRefreshRunId,
+        ageSeconds: ageMs == null ? null : Math.round(ageMs / 1000),
+        refreshCount: cache.refreshCount,
+        lastError: cache.lastError,
+        videos: {
+            count: cache.videos.length,
+            isRefreshing: isVideoRefreshing,
+            lastRefresh: cache.videoLastRefresh,
+            lastRefreshISO: cache.videoLastRefresh ? new Date(cache.videoLastRefresh).toISOString() : null,
+            maxAgeDays: VIDEO_MAX_AGE_DAYS,
+        },
+        ai: {
+            mode: aiMode,
+            provider: aiRuntime.lastProvider,
+            model: aiRuntime.lastModel,
+            lastError: aiRuntime.lastError,
+            available: aiRuntime.disabledUntil <= Date.now(),
+            disabledUntilISO: aiRuntime.disabledUntil ? new Date(aiRuntime.disabledUntil).toISOString() : null,
+            attempts: aiRuntime.attempts.slice(-6),
+        },
+        sources: {
+            jobSources: getTotalJobSources(),
+            newsSources: NEWS_RSS_FEEDS.length + HN_QUERIES.length,
+        },
+    };
+}
+
+function getDashboardPayload(extra = {}) {
+    return {
+        data: cache.dashboardData || [],
+        trends: cache.trends || [],
+        videos: cache.videos || [],
+        stats: cache.stats || {},
+        lastRefresh: cache.lastRefresh,
+        health: getServiceHealth(),
+        ...extra,
+    };
+}
+
 app.get('/', (req, res) => {
     res.send('<h1>✅ Smart News & Job Tracker API Backend is Running!</h1><p>Use /api/dashboard-data to access the endpoints.</p>');
 });
 
+app.get('/api/health', (req, res) => {
+    res.status(cache.lastError ? 503 : 200).json(getServiceHealth());
+});
+
+app.get('/api/ai-modes', (req, res) => {
+    res.json(getAIModePayload());
+});
+
+app.post('/api/ai-modes', (req, res) => {
+    const requested = String(req.body?.mode || '').toLowerCase();
+    if (!AI_MODES.includes(requested)) return res.status(400).json({ error: 'unsupported_mode', modes: AI_MODES });
+    aiMode = requested;
+    aiRuntime.disabledUntil = 0;
+    res.json(getAIModePayload());
+});
+
+app.get('/api/source-registry', (req, res) => {
+    res.json({
+        counts: {
+            apis: JOB_APIS.length,
+            rss: JOB_RSS_FEEDS.length,
+            boards: JOB_BOARD_SOURCES.length,
+            totalJobs: getTotalJobSources(),
+            news: NEWS_RSS_FEEDS.length + HN_QUERIES.length,
+        },
+        boards: JOB_BOARD_SOURCES.map(source => ({
+            name: source.name,
+            host: source.host,
+            url: source.url,
+            region: source.region,
+            mode: 'resilient_html_probe',
+        })),
+    });
+});
+
+app.post('/api/refresh', async (req, res) => {
+    if (isRefreshing) {
+        return res.status(202).json(getDashboardPayload({
+            accepted: true,
+            status: 'already_refreshing',
+            message: 'A refresh is already running. Returning the latest completed snapshot while the new scrape finishes.',
+        }));
+    }
+    const refreshTask = refreshAllData();
+    const refreshStatus = await Promise.race([
+        refreshTask.then(() => 'completed'),
+        wait(REFRESH_RESPONSE_WAIT_MS).then(() => 'refreshing'),
+    ]);
+    if (refreshStatus === 'refreshing') {
+        return res.status(202).json(getDashboardPayload({
+            accepted: true,
+            status: 'refreshing',
+            message: 'Refresh is still running. Returning the latest completed snapshot and continuing in the background.',
+        }));
+    }
+    res.json(getDashboardPayload({
+        accepted: true,
+        status: cache.lastError ? 'completed_with_error' : 'completed',
+    }));
+});
+
 app.get('/api/dashboard-data', async (req, res) => {
-    if (cache.dashboardData) return res.json({ data: cache.dashboardData, lastRefresh: cache.lastRefresh, stats: cache.stats });
-    const [jobs, news] = await Promise.all([getScrapedJobs(), getScrapedNews()]);
-    const merged = [...jobs, ...news].sort(() => Math.random() - 0.5);
-    res.json({ data: merged, lastRefresh: Date.now(), stats: cache.stats });
+    const forceFresh = req.query.fresh === '1' || req.query.refresh === '1' || req.query.fresh === 'true';
+    if (!forceFresh && cache.dashboardData) return res.json({ data: cache.dashboardData, lastRefresh: cache.lastRefresh, stats: cache.stats, health: getServiceHealth() });
+    if (forceFresh && isRefreshing) {
+        return res.status(202).json(getDashboardPayload({
+            accepted: true,
+            status: 'already_refreshing',
+        }));
+    }
+    const refreshRunId = makeRefreshRunId();
+    const [jobs, news] = await Promise.all([getScrapedJobs(refreshRunId), getScrapedNews(refreshRunId)]);
+    const merged = [...jobs, ...news].sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0));
+    cache.dashboardData = merged;
+    cache.lastRefresh = Date.now();
+    cache.lastRefreshRunId = refreshRunId;
+    cache.stats = {
+        totalJobs: jobs.length,
+        totalNews: news.length,
+        totalVideos: cache.videos.length,
+        totalTrends: cache.trends.length,
+        jobSources: getTotalJobSources(),
+        newsSources: NEWS_RSS_FEEDS.length + HN_QUERIES.length,
+        modelProvider: aiRuntime.lastProvider,
+        modelName: aiRuntime.lastModel,
+        dbConnected: Boolean(pool),
+        lastRefreshISO: new Date(cache.lastRefresh).toISOString(),
+        refreshRunId,
+    };
+    res.json({ data: merged, lastRefresh: cache.lastRefresh, stats: cache.stats, health: getServiceHealth() });
 });
 
 app.get('/api/latest-trends', async (req, res) => {
     try {
-        if (cache.trends && cache.trends.length > 0) return res.json({ trends: cache.trends });
+        const forceFresh = req.query.fresh === '1' || req.query.refresh === '1' || req.query.fresh === 'true';
+        if (!forceFresh && cache.trends && cache.trends.length > 0) return res.json({ trends: cache.trends });
         const trends = await getLatestTrends();
+        cache.trends = trends;
         res.json({ trends });
     } catch (e) { res.json({ trends: [] }); }
 });
 
+app.get('/api/videos', async (req, res) => {
+    const force = req.query.refresh === '1' || req.query.refresh === 'true';
+    const videos = await refreshVideosIfNeeded(force);
+    res.json({
+        videos,
+        lastRefresh: cache.videoLastRefresh,
+        lastRefreshISO: cache.videoLastRefresh ? new Date(cache.videoLastRefresh).toISOString() : null,
+        isRefreshing: isVideoRefreshing,
+    });
+});
+
 app.get('/api/ai-insights', async (req, res) => {
-    let videos = cache.videos || [];
+    let videos = await refreshVideosIfNeeded(false);
     try {
         const newsSlice = (cache.dashboardData || []).filter(d => d.type === 'news').slice(0, 10);
         const jobsSlice = (cache.dashboardData || []).filter(d => d.type === 'job').slice(0, 5);
+        const totalNews = (cache.dashboardData || []).filter(d => d.type === 'news').length;
+        const totalJobs = (cache.dashboardData || []).filter(d => d.type === 'job').length;
 
         if (newsSlice.length === 0 || jobsSlice.length === 0) {
             return res.json({ summary_news: "Initializing Live Intelligence.", summary_jobs: "Starting Global Scan.", videos });
@@ -678,11 +1715,28 @@ Return JSON: {"summary_news":"...","summary_jobs":"..."}`;
         const aiJson = await getAIInsight(prompt);
         if (aiJson) {
             aiJson.videos = videos;
+            aiJson.provider = aiRuntime.lastProvider;
+            aiJson.model = aiRuntime.lastModel;
+            aiJson.fallback = false;
             return res.json(aiJson);
         }
-        res.json({ summary_news: "Live Data Active.", summary_jobs: `${jobsSlice.length} Roles Active.`, videos });
+        res.json({
+            summary_news: `Live data active across ${totalNews} news signals.`,
+            summary_jobs: `${totalJobs} tracked roles are currently active.`,
+            videos,
+            provider: 'Deterministic',
+            model: 'offline-summary',
+            fallback: true,
+        });
     } catch (e) {
-        res.json({ summary_news: "AI Unavailable. Live Streams Active.", summary_jobs: "Global Hiring Active.", videos });
+        res.json({
+            summary_news: "AI Unavailable. Live Streams Active.",
+            summary_jobs: "Global Hiring Active.",
+            videos,
+            provider: 'Deterministic',
+            model: 'offline-summary',
+            fallback: true,
+        });
     }
 });
 
@@ -701,9 +1755,42 @@ app.get('/api/company-intel', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // SMART JOB PORTAL API (Embedded Portal)
 // ═══════════════════════════════════════════════════════════════
+app.post('/api/portal-resume-upload', upload.single('resume'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'resume_file_required' });
+    const fileName = req.file.originalname || 'resume';
+    const mime = req.file.mimetype || '';
+    const lowerName = fileName.toLowerCase();
+    try {
+        let text = '';
+        if (mime.includes('pdf') || lowerName.endsWith('.pdf')) {
+            const parsed = await pdfParse(req.file.buffer);
+            text = parsed.text || '';
+        } else if (mime.includes('wordprocessingml') || lowerName.endsWith('.docx')) {
+            const parsed = await mammoth.extractRawText({ buffer: req.file.buffer });
+            text = parsed.value || '';
+        } else if (mime.startsWith('text/') || lowerName.endsWith('.txt') || lowerName.endsWith('.md')) {
+            text = req.file.buffer.toString('utf8');
+        } else {
+            return res.status(400).json({ error: 'unsupported_resume_type', supported: ['pdf', 'docx', 'txt', 'md'] });
+        }
+        const cleaned = cleanText(text).slice(0, 50000);
+        if (!cleaned) return res.status(422).json({ error: 'empty_resume_text' });
+        res.json({
+            text: cleaned,
+            name: fileName,
+            type: mime,
+            size: req.file.size,
+            characters: cleaned.length,
+        });
+    } catch (e) {
+        console.error("Resume upload parse error:", e.message);
+        res.status(422).json({ error: 'resume_parse_failed' });
+    }
+});
+
 app.get('/api/portal-jobs', async (req, res) => {
     if (!pool) return res.json({ jobs: [], total: 0 });
-    const { search, page = 1, limit = 20, location, source } = req.query;
+    const { search, page = 1, limit = 20, location, source, status } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
     let whereClause = '';
@@ -726,6 +1813,15 @@ app.get('/api/portal-jobs', async (req, res) => {
         params.push(`%${source}%`);
         paramCount++;
     }
+    if (status && status !== 'all') {
+        if (normalizeJobStatus(status) === 'open') {
+            conditions.push(`LOWER(COALESCE(status, 'open')) IN ('open', 'new', 'queued')`);
+        } else {
+            conditions.push(`LOWER(COALESCE(status, 'open')) = $${paramCount}`);
+            params.push(normalizeJobStatus(status));
+            paramCount++;
+        }
+    }
 
     if (conditions.length > 0) whereClause = 'WHERE ' + conditions.join(' AND ');
 
@@ -734,9 +1830,9 @@ app.get('/api/portal-jobs', async (req, res) => {
         const total = parseInt(countRes.rows[0].count);
 
         const jobsRes = await pool.query(
-            `SELECT id, title, company, url, source, location, pay, posted_date, status 
-             FROM jobs ${whereClause} 
-             ORDER BY id DESC 
+            `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, url, source, ${SQL_CLEAN('location')} AS location, pay, posted_date, status, notes, match_score, applied_at, follow_up_at, archived_at, refreshed_at, refresh_run_id
+             FROM jobs ${whereClause}
+             ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC
              LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
             [...params, parseInt(limit), offset]
         );
@@ -748,7 +1844,287 @@ app.get('/api/portal-jobs', async (req, res) => {
     }
 });
 
-app.get('/api/stats', (req, res) => res.json(cache.stats));
+app.patch('/api/portal-jobs/:id', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'database_unavailable' });
+    const id = Number(req.params.id);
+    const status = req.body.status ? normalizeJobStatus(req.body.status) : null;
+    const notes = typeof req.body.notes === 'string' ? req.body.notes.slice(0, 5000) : null;
+    const followUpAt = req.body.follow_up_at || null;
+    const updates = [];
+    const params = [];
+    let c = 1;
+    if (status) {
+        updates.push(`status = $${c++}`);
+        params.push(status);
+        if (status === 'applied') updates.push(`applied_at = COALESCE(applied_at, NOW())`);
+        if (status === 'archived') updates.push(`archived_at = NOW()`);
+    }
+    if (notes !== null) {
+        updates.push(`notes = $${c++}`);
+        params.push(notes);
+    }
+    if (followUpAt !== null) {
+        updates.push(`follow_up_at = $${c++}`);
+        params.push(followUpAt ? new Date(followUpAt).toISOString() : null);
+    }
+    if (!updates.length || !Number.isFinite(id)) return res.status(400).json({ error: 'no_updates' });
+    params.push(id);
+    try {
+        const result = await pool.query(
+            `UPDATE jobs SET ${updates.join(', ')} WHERE id = $${c}
+             RETURNING id, title, company, url, source, location, pay, posted_date, status, notes, match_score, applied_at, follow_up_at, archived_at`,
+            params
+        );
+        if (!result.rows.length) return res.status(404).json({ error: 'not_found' });
+        res.json({ job: result.rows[0] });
+    } catch (e) {
+        console.error("Portal update error:", e.message);
+        res.status(500).json({ error: 'update_failed' });
+    }
+});
+
+app.delete('/api/portal-jobs/:id', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'database_unavailable' });
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad_id' });
+    try {
+        await pool.query('DELETE FROM jobs WHERE id = $1', [id]);
+        res.json({ deleted: true });
+    } catch (e) {
+        res.status(500).json({ error: 'delete_failed' });
+    }
+});
+
+app.get('/api/portal-analytics', async (req, res) => {
+    if (!pool) return res.json({ totals: {}, topCompanies: [], topSources: [], topLocations: [], keywords: [], funnel: [] });
+    try {
+        const jobsRes = await pool.query(
+            `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, source, ${SQL_CLEAN('location')} AS location, pay, status, posted_date, created_at, refreshed_at, applied_at
+             FROM jobs ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC LIMIT 2500`
+        );
+        const rows = jobsRes.rows;
+        const countBy = (fn, limit = 12) => {
+            const map = new Map();
+            rows.forEach(row => {
+                const key = fn(row) || 'Unknown';
+                map.set(key, (map.get(key) || 0) + 1);
+            });
+            return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([label, count]) => ({ label, count }));
+        };
+        const keywordCounts = new Map();
+        rows.forEach(row => {
+            TECH_KEYWORDS.forEach(keyword => {
+                if (`${row.title} ${row.source} ${row.company} ${row.location}`.toLowerCase().includes(keyword)) {
+                    keywordCounts.set(keyword, (keywordCounts.get(keyword) || 0) + 1);
+                }
+            });
+        });
+        const statusCounts = countBy(row => normalizeJobStatus(row.status));
+        const now = Date.now();
+        const ageBucket = (row) => {
+            const created = row.refreshed_at ? new Date(row.refreshed_at).getTime() : (row.created_at ? new Date(row.created_at).getTime() : now);
+            const hours = (now - created) / (60 * 60 * 1000);
+            if (hours <= 6) return 'last 6h';
+            if (hours <= 24) return 'last 24h';
+            if (hours <= 72) return 'last 3d';
+            return 'older';
+        };
+        const activeCount = rows.filter(r => !['archived', 'rejected'].includes(normalizeJobStatus(r.status))).length;
+        const appliedCount = rows.filter(r => ['applied', 'interview', 'offer'].includes(normalizeJobStatus(r.status))).length;
+        const interviewCount = rows.filter(r => ['interview', 'offer'].includes(normalizeJobStatus(r.status))).length;
+        const offerCount = rows.filter(r => normalizeJobStatus(r.status) === 'offer').length;
+        res.json({
+            totals: {
+                jobs: rows.length,
+                active: activeCount,
+                applied: appliedCount,
+                interviews: interviewCount,
+                offers: offerCount,
+                companies: new Set(rows.map(r => r.company).filter(Boolean)).size,
+                sources: new Set(rows.map(r => r.source).filter(Boolean)).size,
+                remote: rows.filter(r => classifyWorkMode(r.location) === 'remote').length,
+                fresh24h: rows.filter(r => ageBucket(r) !== 'older' && ageBucket(r) !== 'last 3d').length,
+            },
+            conversion: {
+                applyRate: rows.length ? Math.round((appliedCount / rows.length) * 100) : 0,
+                interviewRate: appliedCount ? Math.round((interviewCount / appliedCount) * 100) : 0,
+                offerRate: appliedCount ? Math.round((offerCount / appliedCount) * 100) : 0,
+            },
+            funnel: ['open', 'applied', 'interview', 'offer', 'rejected', 'archived'].map(label => ({
+                label,
+                count: statusCounts.find(item => item.label === label)?.count || 0,
+            })),
+            topCompanies: countBy(row => row.company),
+            topSources: countBy(row => row.source),
+            topLocations: countBy(row => row.location),
+            workModes: countBy(row => classifyWorkMode(row.location)),
+            seniority: countBy(row => classifySeniority(row.title)),
+            roleFamilies: countBy(row => classifyRoleFamily(row.title)),
+            freshness: countBy(ageBucket),
+            topTitles: countBy(row => row.title, 15),
+            sourceWorkMode: countBy(row => `${row.source || 'Source'} / ${classifyWorkMode(row.location)}`, 12),
+            keywords: [...keywordCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14).map(([label, count]) => ({ label, count })),
+        });
+    } catch (e) {
+        console.error("Analytics error:", e.message);
+        res.status(500).json({ error: 'analytics_failed' });
+    }
+});
+
+app.post('/api/portal-rank-resume', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'database_unavailable' });
+    const resumeText = String(req.body.resumeText || '').slice(0, 20000);
+    if (!resumeText.trim()) return res.status(400).json({ error: 'resume_required' });
+    const limit = Math.min(Number(req.body.limit || 25), 100);
+    try {
+        const retrieved = await retrieveJobsForRag({ resumeText, question: req.body.goal || '', limit, sampleLimit: 1800 });
+        const ranked = retrieved.jobs;
+        for (const job of ranked.slice(0, 50)) {
+            await pool.query('UPDATE jobs SET match_score = $1 WHERE id = $2', [job.match_score, job.id]);
+        }
+        const report = buildAgenticResumeReport(resumeText, retrieved);
+        res.json({
+            matches: ranked,
+            report,
+            reportMarkdown: formatAgenticReport(report, ranked),
+            retrieval: {
+                sampleSize: retrieved.sampleSize,
+                analytics: retrieved.analytics,
+            },
+        });
+    } catch (e) {
+        console.error("Resume rank error:", e.message);
+        res.status(500).json({ error: 'rank_failed' });
+    }
+});
+
+app.post('/api/portal-agentic-rag', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'database_unavailable' });
+    const resumeText = String(req.body.resumeText || '').slice(0, 20000);
+    const question = String(req.body.question || req.body.goal || 'Find my strongest job matches and gaps.').slice(0, 1200);
+    try {
+        const retrieved = await retrieveJobsForRag({ resumeText, question, limit: 30, sampleLimit: 2000 });
+        const report = buildAgenticResumeReport(resumeText, retrieved);
+        const deterministic = question.trim()
+            ? `${formatAgenticReport(report, retrieved.jobs)}\n\n${formatMarketAnswer(question, retrieved)}`
+            : formatAgenticReport(report, retrieved.jobs);
+        const prompt = `You are an Agentic RAG career coach. Use only the retrieved evidence. Improve the answer but do not invent companies or jobs.
+Question: ${question}
+Resume profile: ${JSON.stringify(report.profile)}
+Retrieved jobs:
+${retrieved.jobs.slice(0, 16).map(job => `- ${job.match_score}% ${job.title} @ ${job.company} (${job.location}) [${job.source}]`).join('\n')}
+Deterministic draft:
+${deterministic}
+Return JSON: {"answer":"markdown answer","actions":["action"],"risks":["risk"]}`;
+        const ai = coerceModelObject(await getAIInsight(prompt));
+        res.json({
+            answer: cleanModelText(ai?.answer) || deterministic,
+            actions: ai?.actions || report.actions,
+            risks: ai?.risks || [],
+            matches: retrieved.jobs,
+            report,
+            retrieval: { sampleSize: retrieved.sampleSize, analytics: retrieved.analytics },
+            provider: aiRuntime.lastProvider,
+            model: aiRuntime.lastModel,
+            fallback: !ai?.answer,
+        });
+    } catch (e) {
+        console.error("Agentic RAG error:", e.message);
+        res.status(500).json({ error: 'agentic_rag_failed' });
+    }
+});
+
+app.post('/api/portal-ai-toolkit', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'database_unavailable' });
+    const jobId = Number(req.body.jobId);
+    const type = String(req.body.type || 'skill-gap');
+    const resumeText = String(req.body.resumeText || '').slice(0, 12000);
+    const allowed = new Set(['cover-letter', 'interview-prep', 'cold-message', 'skill-gap', 'resume-summary', 'recruiter-email']);
+    if (!allowed.has(type) || !Number.isFinite(jobId)) return res.status(400).json({ error: 'bad_request' });
+    try {
+        const jobRes = await pool.query('SELECT * FROM jobs WHERE id = $1', [jobId]);
+        if (!jobRes.rows.length) return res.status(404).json({ error: 'not_found' });
+        const job = jobRes.rows[0];
+        const retrieved = await retrieveJobsForRag({ resumeText, question: `${type} ${job.title} ${job.company}`, limit: 12, sampleLimit: 1200 });
+        const report = buildAgenticResumeReport(resumeText, retrieved);
+        const prompt = `You are an expert Agentic RAG career coach. Generate ${type} content for this job using only the resume, selected job, and retrieved evidence.
+Resume:
+${resumeText || 'No resume provided.'}
+
+Job:
+${buildJobPromptContext(job)}
+
+Retrieved evidence:
+${retrieved.jobs.slice(0, 10).map(item => `- ${item.match_score}% ${item.title} @ ${item.company} (${item.location})`).join('\n')}
+
+Detected profile:
+${JSON.stringify(report.profile)}
+
+Return JSON: {"result":"markdown content"}`;
+        const ai = coerceModelObject(await getAIInsight(prompt));
+        res.json({
+            result: cleanModelText(ai?.result || ai?.answer) || fallbackToolkitAgentic(type, job, resumeText, retrieved),
+            provider: aiRuntime.lastProvider,
+            model: aiRuntime.lastModel,
+            fallback: !ai?.result,
+            retrieval: { sampleSize: retrieved.sampleSize, evidence: retrieved.jobs.slice(0, 8), report },
+        });
+    } catch (e) {
+        console.error("Toolkit error:", e.message);
+        res.status(500).json({ error: 'toolkit_failed' });
+    }
+});
+
+app.post('/api/portal-market-query', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'database_unavailable' });
+    const question = String(req.body.question || '').slice(0, 1000);
+    if (!question.trim()) return res.status(400).json({ error: 'question_required' });
+    try {
+        const retrieved = await retrieveJobsForRag({ question, resumeText: String(req.body.resumeText || ''), limit: 35, sampleLimit: 2200 });
+        const context = retrieved.jobs.map(j => `- ${j.match_score}% ${j.title} @ ${j.company} (${j.location || 'Remote'}) ${j.pay || ''} [${j.source || 'source'}]`).join('\n');
+        const deterministic = formatMarketAnswer(question, retrieved);
+        const prompt = `Answer the user's job-market question using only this retrieved job database evidence.
+Question: ${question}
+Retrieved evidence:
+${context}
+Deterministic draft:
+${deterministic}
+Return JSON: {"answer":"concise markdown answer with evidence","supporting_companies":["company1","company2"],"signals":["signal"]}`;
+        const ai = coerceModelObject(await getAIInsight(prompt));
+        res.json({
+            answer: cleanModelText(ai?.answer) || deterministic,
+            supporting_companies: ai?.supporting_companies || [...new Set(retrieved.jobs.map(r => r.company).filter(Boolean))].slice(0, 12),
+            signals: ai?.signals || retrieved.analytics.roleFamilies?.map(item => `${item.label}: ${item.count}`) || [],
+            retrieval: { sampleSize: retrieved.sampleSize, analytics: retrieved.analytics, evidence: retrieved.jobs.slice(0, 12) },
+            provider: aiRuntime.lastProvider,
+            model: aiRuntime.lastModel,
+            fallback: !ai?.answer,
+        });
+    } catch (e) {
+        console.error("Market query error:", e.message);
+        res.status(500).json({ error: 'market_query_failed' });
+    }
+});
+
+app.get('/api/portal-export.csv', async (req, res) => {
+    if (!pool) return res.status(503).send('database unavailable');
+    try {
+        const jobsRes = await pool.query(
+            `SELECT id, title, company, location, pay, source, status, match_score, posted_date, applied_at, follow_up_at, notes, url
+             FROM jobs ORDER BY id DESC LIMIT 5000`
+        );
+        const headers = ['id', 'title', 'company', 'location', 'pay', 'source', 'status', 'match_score', 'posted_date', 'applied_at', 'follow_up_at', 'notes', 'url'];
+        const escapeCsv = value => `"${String(value ?? '').replace(/"/g, '""')}"`;
+        const csv = [headers.join(','), ...jobsRes.rows.map(row => headers.map(h => escapeCsv(row[h])).join(','))].join('\n');
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="smart-job-portal-export.csv"');
+        res.send(csv);
+    } catch (e) {
+        res.status(500).send('export failed');
+    }
+});
+
+app.get('/api/stats', (req, res) => res.json({ ...cache.stats, health: getServiceHealth() }));
 
 // ═══════════════════════════════════════════════════════════════
 // STARTUP
@@ -756,11 +2132,12 @@ app.get('/api/stats', (req, res) => res.json(cache.stats));
 const PORT = 8000;
 app.listen(PORT, async () => {
     console.log(`\n🚀 Smart News & Job Tracker Backend on port ${PORT}`);
-    console.log(`📊 Job Sources: ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS = ${JOB_APIS.length + JOB_RSS_FEEDS.length} total`);
+    console.log(`📊 Job Sources: ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS + ${JOB_BOARD_SOURCES.length} boards = ${getTotalJobSources()} total`);
     console.log(`📰 News Sources: ${NEWS_RSS_FEEDS.length} RSS + ${HN_QUERIES.length} HN queries = ${NEWS_RSS_FEEDS.length + HN_QUERIES.length} total`);
     await ensureDBTables();
+    await cleanupKnownJobNoise();
     refreshAllData(); // Trigger immediately on start
     setInterval(() => refreshAllData(), REFRESH_INTERVAL);
-    setInterval(() => purgeDatabase(), DB_PURGE_INTERVAL);
+    setInterval(() => pruneDatabase(), DB_PURGE_INTERVAL);
     console.log(`⏱️  Auto-refresh: every 10 min | DB purge: every 3 hours`);
 });
