@@ -1,6 +1,19 @@
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 require('dotenv').config({ path: path.resolve(__dirname, '../backend/.env'), override: false });
+try {
+    const sharedEnv = require('dotenv').parse(fs.readFileSync(path.resolve(__dirname, '../../smart_job_portal/.env')));
+    const sharedAllowlist = [
+        'OPENROUTER_API_KEY', 'Qwen3_80b_token', 'Qwen3_4b_token', 'gpt-oss-120b_token',
+        'Gemma3b_token', 'Gemma4_26b_token', 'Gemma4_31b_token',
+        'HUGGINGFACE_API_KEY', 'HF_TOKEN', 'YOUTUBE_API_KEY', 'YOUTUBE_CLIENT_ID',
+        'YOUTUBE_CLIENT_SECRET', 'YOUTUBE_REFRESH_TOKEN', 'LINKEDIN_FEED_URLS',
+    ];
+    sharedAllowlist.forEach(key => {
+        if (!process.env[key] && sharedEnv[key]) process.env[key] = sharedEnv[key];
+    });
+} catch (_) { }
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -12,6 +25,7 @@ const ytSearch = require('yt-search');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const { JOB_APIS, JOB_RSS_FEEDS, JOB_BOARD_SOURCES, NEWS_RSS_FEEDS, HN_QUERIES } = require('./sources');
+const { getDailyNewsSources, getLinkedInImports, getDailyNewsBridgeStatus } = require('./dailyNewsBridge');
 
 const app = express();
 app.use(cors());
@@ -53,10 +67,16 @@ const OPENROUTER_MODELS = (process.env.OPENROUTER_MODELS || DEFAULT_OPENROUTER_M
 const AI_CIRCUIT_BREAKER_MS = Number(process.env.AI_CIRCUIT_BREAKER_MS || 5 * 60 * 1000);
 const YOUTUBE_QUERY_LIMIT = Number(process.env.YOUTUBE_QUERY_LIMIT || 36);
 const VIDEO_REFRESH_INTERVAL_MS = Number(process.env.VIDEO_REFRESH_INTERVAL_MS || 10 * 60 * 1000);
-const VIDEO_MAX_AGE_DAYS = Number(process.env.VIDEO_MAX_AGE_DAYS || 14);
+const VIDEO_MAX_AGE_DAYS = Number(process.env.VIDEO_MAX_AGE_DAYS || 7);
+const JOB_MAX_AGE_DAYS = Number(process.env.JOB_MAX_AGE_DAYS || 30);
 const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 14);
 const VIDEO_DB_RETENTION_HOURS = Number(process.env.VIDEO_DB_RETENTION_HOURS || 72);
-const AI_MODES = ['auto', 'openai', 'gemini', 'openrouter', 'offline'];
+const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
+const OLLAMA_MODELS = String(process.env.OLLAMA_MODELS || 'qwen3:4b,gemma3:4b,llama3.2:3b,mistral:7b')
+    .split(',').map(model => model.trim()).filter(Boolean);
+const HUGGINGFACE_MODELS = String(process.env.HUGGINGFACE_MODELS || 'Qwen/Qwen2.5-7B-Instruct,google/gemma-2-9b-it,mistralai/Mistral-7B-Instruct-v0.3')
+    .split(',').map(model => model.trim()).filter(Boolean);
+const AI_MODES = ['auto', 'free', 'ollama', 'huggingface', 'openai', 'gemini', 'openrouter', 'offline'];
 let aiMode = AI_MODES.includes(String(process.env.AI_MODE || '').toLowerCase())
     ? String(process.env.AI_MODE).toLowerCase()
     : 'auto';
@@ -67,10 +87,14 @@ function getTotalJobSources() {
 
 function getAIModePayload() {
     const openRouterTokens = getOpenRouterTokens();
+    const huggingFaceToken = process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
     return {
         active: aiMode,
         modes: [
-            { id: 'auto', label: 'Auto fallback', available: Boolean(process.env.OPENAI_API_KEY || genAI || process.env.OPENROUTER_API_KEY || process.env.Qwen3_80b_token || process.env['gpt-oss-120b_token']) },
+            { id: 'auto', label: 'Auto fallback', available: Boolean(process.env.OPENAI_API_KEY || genAI || openRouterTokens.length || huggingFaceToken || OLLAMA_BASE_URL) },
+            { id: 'free', label: 'Free models only', available: Boolean(openRouterTokens.length || huggingFaceToken || OLLAMA_BASE_URL), configuredModels: [...OLLAMA_MODELS, ...HUGGINGFACE_MODELS, ...OPENROUTER_MODELS] },
+            { id: 'ollama', label: 'Ollama local', available: true, endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS },
+            { id: 'huggingface', label: 'Hugging Face', available: Boolean(huggingFaceToken), configuredModels: HUGGINGFACE_MODELS },
             { id: 'openai', label: 'OpenAI', available: Boolean(process.env.OPENAI_API_KEY), primaryModel: OPENAI_MODEL },
             { id: 'gemini', label: 'Gemini', available: Boolean(genAI) },
             { id: 'openrouter', label: 'OpenRouter', available: openRouterTokens.length > 0, primaryModel: OPENROUTER_MODELS[0], configuredModels: OPENROUTER_MODELS },
@@ -134,6 +158,9 @@ async function ensureDBTables() {
                 applied_at TIMESTAMP,
                 follow_up_at TIMESTAMP,
                 archived_at TIMESTAMP,
+                source_published_at TIMESTAMP,
+                first_seen_at TIMESTAMP DEFAULT NOW(),
+                last_seen_at TIMESTAMP DEFAULT NOW(),
                 refreshed_at TIMESTAMP DEFAULT NOW(),
                 refresh_run_id TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
@@ -143,6 +170,9 @@ async function ensureDBTables() {
                 headline TEXT, source TEXT, url TEXT UNIQUE,
                 category TEXT, snippet TEXT,
                 published_date TEXT,
+                source_published_at TIMESTAMP,
+                first_seen_at TIMESTAMP DEFAULT NOW(),
+                last_seen_at TIMESTAMP DEFAULT NOW(),
                 refreshed_at TIMESTAMP DEFAULT NOW(),
                 refresh_run_id TEXT,
                 created_at TIMESTAMP DEFAULT NOW()
@@ -153,6 +183,7 @@ async function ensureDBTables() {
                 channel TEXT, published TEXT,
                 views BIGINT DEFAULT 0,
                 published_ago TEXT,
+                published_at TIMESTAMP,
                 refreshed_at TIMESTAMP DEFAULT NOW(),
                 created_at TIMESTAMP DEFAULT NOW()
             );
@@ -163,12 +194,19 @@ async function ensureDBTables() {
             ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied_at TIMESTAMP;
             ALTER TABLE jobs ADD COLUMN IF NOT EXISTS follow_up_at TIMESTAMP;
             ALTER TABLE jobs ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_published_at TIMESTAMP;
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW();
+            ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT NOW();
             ALTER TABLE jobs ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMP DEFAULT NOW();
             ALTER TABLE jobs ADD COLUMN IF NOT EXISTS refresh_run_id TEXT;
             ALTER TABLE news ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMP DEFAULT NOW();
             ALTER TABLE news ADD COLUMN IF NOT EXISTS refresh_run_id TEXT;
+            ALTER TABLE news ADD COLUMN IF NOT EXISTS source_published_at TIMESTAMP;
+            ALTER TABLE news ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW();
+            ALTER TABLE news ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP DEFAULT NOW();
             ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS views BIGINT DEFAULT 0;
             ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS published_ago TEXT;
+            ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS published_at TIMESTAMP;
             ALTER TABLE youtube_videos ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMP DEFAULT NOW();
         `);
         await pool.query(`
@@ -187,8 +225,8 @@ async function pruneDatabase() {
     try {
         const interval = `${DB_RETENTION_HOURS} hours`;
         const videoInterval = `${VIDEO_DB_RETENTION_HOURS} hours`;
-        await pool.query("DELETE FROM jobs WHERE created_at < NOW() - $1::interval;", [interval]);
-        await pool.query("DELETE FROM news WHERE created_at < NOW() - $1::interval;", [interval]);
+        await pool.query("DELETE FROM jobs WHERE COALESCE(last_seen_at, refreshed_at, created_at) < NOW() - $1::interval;", [interval]);
+        await pool.query("DELETE FROM news WHERE COALESCE(last_seen_at, refreshed_at, created_at) < NOW() - $1::interval;", [interval]);
         await pool.query("DELETE FROM youtube_videos WHERE COALESCE(refreshed_at, created_at) < NOW() - $1::interval;", [videoInterval]);
         console.log("✅ Database purged successfully. Fresh collection starting...");
     } catch (e) { console.error("❌ Purge error:", e.message); }
@@ -271,6 +309,25 @@ function sortByDateDesc(items = [], dateKey = 'date') {
     return [...items].sort((a, b) => getTimestamp(b[dateKey]) - getTimestamp(a[dateKey]));
 }
 
+function toIsoOrNull(value) {
+    const timestamp = getTimestamp(value);
+    return timestamp ? new Date(timestamp).toISOString() : null;
+}
+
+function freshnessLabel(publishedAt, firstSeenAt, lastSeenAt) {
+    const published = getTimestamp(publishedAt);
+    const firstSeen = getTimestamp(firstSeenAt);
+    const lastSeen = getTimestamp(lastSeenAt);
+    const ageHours = published ? Math.max(0, (Date.now() - published) / 3_600_000) : null;
+    return {
+        state: ageHours != null && ageHours <= 24 ? 'breaking' : (firstSeen && Date.now() - firstSeen <= 3_600_000 ? 'new' : 'verified'),
+        ageHours: ageHours == null ? null : Math.round(ageHours * 10) / 10,
+        publishedAt: published ? new Date(published).toISOString() : null,
+        firstSeenAt: firstSeen ? new Date(firstSeen).toISOString() : null,
+        verifiedAt: lastSeen ? new Date(lastSeen).toISOString() : null,
+    };
+}
+
 function inferCoordsFromText(value = '') {
     const text = value.toLowerCase();
     const directMatches = [
@@ -308,6 +365,7 @@ function getPreciseCoords(loc) {
 
 function toJobPoint(j, index = 0) {
     const hub = getPreciseCoords(j.location || j.location_name || j.company || j.title || 'Remote');
+    const freshness = freshnessLabel(j.source_published_at || j.posted_date, j.first_seen_at || j.created_at, j.last_seen_at || j.refreshed_at);
     return {
         id: j.id ? `job-db-${j.id}` : `job-${index}-${hashString(j.url || j.title || String(index))}`,
         type: 'job',
@@ -318,8 +376,13 @@ function toJobPoint(j, index = 0) {
         location: j.location || j.location_name || 'Remote',
         url: j.url || '#',
         isRemote: /remote|anywhere|global|worldwide/i.test(j.location || ''),
-        time: j.time || j.posted_date || 'cached',
-        collectedAt: j.refreshed_at ? new Date(j.refreshed_at).getTime() : (j.created_at ? new Date(j.created_at).getTime() : 0),
+        time: j.time || freshness.publishedAt || 'Recently verified',
+        publishedAt: freshness.publishedAt,
+        firstSeenAt: freshness.firstSeenAt,
+        verifiedAt: freshness.verifiedAt,
+        freshness: freshness.state,
+        ageHours: freshness.ageHours,
+        collectedAt: getTimestamp(freshness.publishedAt || freshness.firstSeenAt),
         refreshRunId: j.refresh_run_id || null,
         size: 0.4,
         color: '#15b86a',
@@ -328,6 +391,7 @@ function toJobPoint(j, index = 0) {
 
 function toNewsPoint(n, index = 0) {
     const hub = getPreciseCoords(n.headline || n.title || n.source || 'Global');
+    const freshness = freshnessLabel(n.source_published_at || n.published_date, n.first_seen_at || n.created_at, n.last_seen_at || n.refreshed_at);
     return {
         id: n.id ? `news-db-${n.id}` : `news-${index}-${hashString(n.url || n.headline || String(index))}`,
         type: 'news',
@@ -337,8 +401,13 @@ function toNewsPoint(n, index = 0) {
         source: n.source || n.company_or_source || 'Source',
         location: n.location || 'Global',
         url: n.url || '#',
-        time: n.time || n.published_date || 'cached',
-        collectedAt: n.refreshed_at ? new Date(n.refreshed_at).getTime() : (n.created_at ? new Date(n.created_at).getTime() : 0),
+        time: n.time || freshness.publishedAt || 'Recently verified',
+        publishedAt: freshness.publishedAt,
+        firstSeenAt: freshness.firstSeenAt,
+        verifiedAt: freshness.verifiedAt,
+        freshness: freshness.state,
+        ageHours: freshness.ageHours,
+        collectedAt: getTimestamp(freshness.publishedAt || freshness.firstSeenAt),
         refreshRunId: n.refresh_run_id || null,
         radius: 4.5,
         color: '#ef4444',
@@ -454,6 +523,51 @@ async function callOpenAIChat(prompt, modelName) {
     return parseJsonFromModel(res.data.choices?.[0]?.message?.content);
 }
 
+async function callOllama(prompt, modelName) {
+    const res = await axios.post(`${OLLAMA_BASE_URL}/api/chat`, {
+        model: modelName,
+        stream: false,
+        format: 'json',
+        messages: [
+            { role: 'system', content: 'Return only valid JSON. Do not wrap it in markdown.' },
+            { role: 'user', content: prompt },
+        ],
+        options: { temperature: 0.25 },
+    }, { timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 45000) });
+    return parseJsonFromModel(res.data?.message?.content || res.data?.response);
+}
+
+async function callHuggingFace(prompt, modelName) {
+    const token = process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
+    if (!token) throw new Error('HUGGINGFACE_API_KEY is not configured');
+    const res = await axios.post('https://router.huggingface.co/v1/chat/completions', {
+        model: modelName,
+        messages: [
+            { role: 'system', content: 'Return only valid JSON. Do not wrap it in markdown.' },
+            { role: 'user', content: prompt },
+        ],
+        temperature: 0.25,
+        max_tokens: 1600,
+    }, {
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        timeout: Number(process.env.HUGGINGFACE_TIMEOUT_MS || 25000),
+    });
+    return parseJsonFromModel(res.data?.choices?.[0]?.message?.content);
+}
+
+async function inspectOllama() {
+    try {
+        const res = await axios.get(`${OLLAMA_BASE_URL}/api/tags`, { timeout: 1800 });
+        return {
+            reachable: true,
+            endpoint: OLLAMA_BASE_URL,
+            installed: (res.data?.models || []).map(item => item.name).filter(Boolean),
+        };
+    } catch (error) {
+        return { reachable: false, endpoint: OLLAMA_BASE_URL, installed: [], error: summarizeModelError(error) };
+    }
+}
+
 async function getAIInsight(prompt) {
     if (aiMode === 'offline') {
         aiRuntime.lastError = 'offline_mode';
@@ -461,7 +575,9 @@ async function getAIInsight(prompt) {
     }
     const allowOpenAI = aiMode === 'auto' || aiMode === 'openai';
     const allowGemini = aiMode === 'auto' || aiMode === 'gemini';
-    const allowOpenRouter = aiMode === 'auto' || aiMode === 'openrouter';
+    const allowOpenRouter = aiMode === 'auto' || aiMode === 'free' || aiMode === 'openrouter';
+    const allowOllama = aiMode === 'ollama' || aiMode === 'free' || (aiMode === 'auto' && String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true');
+    const allowHuggingFace = aiMode === 'huggingface' || aiMode === 'free' || (aiMode === 'auto' && Boolean(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN));
     const attempts = [];
     const recordFailure = (provider, model, err) => {
         const error = summarizeModelError(err);
@@ -476,6 +592,27 @@ async function getAIInsight(prompt) {
         aiRuntime = { lastProvider: provider, lastModel: model, lastError: null, disabledUntil: 0, attempts, mode: aiMode };
         return data;
     };
+
+    if (allowOllama) {
+        for (const modelName of OLLAMA_MODELS) {
+            try {
+                return recordSuccess('Ollama', modelName, await callOllama(prompt, modelName));
+            } catch (error) {
+                recordFailure('Ollama', modelName, error);
+                if (['ECONNREFUSED', 'ETIMEDOUT'].includes(error.code)) break;
+            }
+        }
+    }
+
+    if (allowHuggingFace) {
+        for (const modelName of HUGGINGFACE_MODELS) {
+            try {
+                return recordSuccess('Hugging Face', modelName, await callHuggingFace(prompt, modelName));
+            } catch (error) {
+                recordFailure('Hugging Face', modelName, error);
+            }
+        }
+    }
 
     if (allowOpenAI && process.env.OPENAI_API_KEY) {
         for (const modelName of [OPENAI_MODEL, ...OPENAI_FALLBACK_MODELS]) {
@@ -549,6 +686,21 @@ async function getAIInsight(prompt) {
 // BATCH FETCH UTILITY
 // ═══════════════════════════════════════════════════════════════
 const parser = new Parser({ timeout: RSS_TIMEOUT, headers: { 'User-Agent': 'Mozilla/5.0 SmartNewsTracker/1.0' } });
+const sourceHealth = new Map();
+
+function recordSourceHealth(kind, source, ok, itemCount = 0, detail = null) {
+    const key = `${kind}:${source}`;
+    const previous = sourceHealth.get(key) || { consecutiveFailures: 0 };
+    sourceHealth.set(key, {
+        kind,
+        source,
+        ok,
+        itemCount,
+        detail,
+        checkedAt: new Date().toISOString(),
+        consecutiveFailures: ok ? 0 : previous.consecutiveFailures + 1,
+    });
+}
 
 async function fetchBatched(urls, fetcher, batchSize = BATCH_SIZE) {
     const results = [];
@@ -575,8 +727,22 @@ function absoluteUrl(href, baseUrl) {
     }
 }
 
-const NON_JOB_ANCHOR_PATTERN = /(manual|handbook|flowchart|registration|login|sign in|post new job|post international jobs|employer|recruiter|view jobs|jobs archives|job fairs|model career centers|career schemes|career information|links to govt|find domestic|find international|training by|advisories|international resources|ncs meta data|international job opportunities|privacy|terms|about us|contact us|faq|help|sitemap)/i;
-const GENERIC_NON_ROLE_PATTERN = /^(software development|content writing|consulting|business consulting|business analysis|debugging|agile development|project management|prototyping|mobile app development|web development|data management|international jobs|marketing|data entry|translation|research|training|design|testing)$/i;
+function canonicalSourceUrl(value) {
+    try {
+        const url = new URL(value);
+        url.hash = '';
+        [...url.searchParams.keys()].forEach(key => {
+            if (/^(utm_.+|ref|source|campaign|trk)$/i.test(key)) url.searchParams.delete(key);
+        });
+        return url.toString().replace(/\/$/, '');
+    } catch (_) {
+        return value;
+    }
+}
+
+const NON_JOB_ANCHOR_PATTERN = /(manual|handbook|flowchart|registration|login|sign in|join now|post new job|post international jobs|employer|recruiter|view jobs|jobs archives|job fairs|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|model career centers|career schemes|career information|links to govt|find domestic|find international|training by|advisories|international resources|ncs meta data|international job opportunities|privacy|terms|about us|contact us|faq|help|sitemap)/i;
+const GENERIC_NON_ROLE_PATTERN = /^(software development|software testing|content writing|consulting|business consulting|business analysis|debugging|agile development|project management|prototyping|mobile app development|web development|data management|international jobs|marketing|digital marketing|data entry|translation|research|training|design|graphic design|accounting|call center|electrical engineering|event management|artificial intelligence)$/i;
+const ROLE_TITLE_PATTERN = /(engineer|developer|architect|analyst|scientist|specialist|consultant|manager|designer|writer|administrator|officer|executive|associate|assistant|trainee|intern|operator|technician|accountant|recruiter|sales|support|nurse|teacher|lead|director|head|python|react|node|java|golang|devops|full[ -]?stack|front[ -]?end|back[ -]?end|software|cloud|security|machine learning|data)/i;
 
 function isLikelyPersistableJob(job = {}) {
     const title = cleanText(job.title || '');
@@ -614,6 +780,7 @@ function extractJsonLdJobs(html, source) {
                     url: node.url || source.url,
                     isRemote: /remote/i.test(`${node.jobLocationType || ''} ${location}`),
                     pay: cleanText(node.baseSalary?.value?.value || node.baseSalary?.value || 'N/A'),
+                    sourcePublishedAt: toIsoOrNull(node.datePosted),
                     time: 'Board',
                     source: source.name,
                 });
@@ -631,7 +798,8 @@ function extractAnchorJobs(html, source) {
     while ((match = anchorRegex.exec(html)) && jobs.length < 20) {
         const href = match[1];
         const text = cleanText(match[2]);
-        const looksLikeJob = /job|career|opening|developer|engineer|intern|software|data|cloud|remote/i.test(`${href} ${text}`);
+        const detailUrl = /(\/jobs?\/view\/\d+|\/job\/[^?#]+|job[_-]?id=|jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(?:y|ies)\/[^?#]+|\/project\/\d+)/i.test(href);
+        const looksLikeJob = detailUrl && ROLE_TITLE_PATTERN.test(text) && !NON_JOB_ANCHOR_PATTERN.test(text);
         if (!looksLikeJob || text.length < 8 || text.length > 140 || !isLikelyPersistableJob({ title: text, source: source.name })) continue;
         const url = absoluteUrl(href, source.url);
         if (seen.has(url)) continue;
@@ -664,31 +832,17 @@ async function getBoardSourceJobs() {
                 validateStatus: status => status >= 200 && status < 500,
             });
             if (res.status >= 400 || typeof res.data !== 'string') {
-                return [{
-                    title: `${source.name} source connected - blocked or requires auth`,
-                    company: source.name,
-                    location: source.region || 'Source',
-                    url: source.url,
-                    isRemote: false,
-                    pay: 'N/A',
-                    time: `HTTP ${res.status}`,
-                    source: `${source.name} Monitor`,
-                }];
+                recordSourceHealth('job_board', source.name, false, 0, `HTTP ${res.status}`);
+                return [];
             }
             const jsonLdJobs = extractJsonLdJobs(res.data, source);
             const anchorJobs = jsonLdJobs.length ? [] : extractAnchorJobs(res.data, source);
-            return [...jsonLdJobs, ...anchorJobs].slice(0, 25);
+            const found = [...jsonLdJobs, ...anchorJobs].slice(0, 25);
+            recordSourceHealth('job_board', source.name, true, found.length, found.length ? null : 'reachable_no_public_jobs');
+            return found;
         } catch (e) {
-            return [{
-                title: `${source.name} source connected - fetch failed`,
-                company: source.name,
-                location: source.region || 'Source',
-                url: source.url,
-                isRemote: false,
-                pay: 'N/A',
-                time: 'Source check',
-                source: `${source.name} Monitor`,
-            }];
+            recordSourceHealth('job_board', source.name, false, 0, summarizeModelError(e));
+            return [];
         }
     }, 4);
 }
@@ -707,6 +861,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
                     title: j.title, company: j.company_name || 'Startup',
                     location: j.candidate_required_location || 'Remote',
                     url: j.url, isRemote: true, pay: j.salary || 'N/A',
+                    sourcePublishedAt: toIsoOrNull(j.publication_date),
                     time: "🔴 LIVE", source: source.name
                 }));
             } else if (source.type === 'muse' && res.data?.results) {
@@ -714,30 +869,42 @@ const getScrapedJobs = async (refreshRunId = null) => {
                     title: j.name, company: j.company?.name || 'Company',
                     location: j.locations?.[0]?.name || 'Flexible',
                     url: j.refs?.landing_page || '#', isRemote: (j.locations?.[0]?.name || '').toLowerCase().includes('remote'),
+                    sourcePublishedAt: toIsoOrNull(j.publication_date),
                     pay: 'N/A', time: "⚡ POSTED", source: source.name
                 }));
             } else if (source.type === 'hn-jobs' && res.data?.hits) {
                 res.data.hits.slice(0, 15).forEach(h => items.push({
                     title: h.title, company: 'HackerNews',
                     location: 'Remote / Global', url: h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+                    sourcePublishedAt: toIsoOrNull(h.created_at),
                     isRemote: true, pay: 'N/A', time: "🟠 HN", source: source.name
                 }));
             }
+            recordSourceHealth('job_api', source.name, true, items.length);
             return items;
-        } catch (e) { return []; }
+        } catch (e) {
+            recordSourceHealth('job_api', source.name, false, 0, summarizeModelError(e));
+            return [];
+        }
     });
 
     // 2. Fetch from RSS
     const rssJobs = await fetchBatched(JOB_RSS_FEEDS, async (feedUrl) => {
         try {
             const feed = await parser.parseURL(feedUrl);
-            return (feed.items || []).slice(0, 15).map(item => ({
-                title: item.title || 'Role', company: feed.title || 'Company',
+            const items = (feed.items || []).slice(0, 15).map(item => ({
+                title: cleanText(item.title || 'Role'), company: cleanText(feed.title || 'Company'),
                 location: item.categories?.[0] || 'Remote',
                 url: item.link || '#', isRemote: true,
+                sourcePublishedAt: toIsoOrNull(item.isoDate || item.pubDate),
                 pay: 'N/A', time: "🟢 RSS LIVE", source: feed.title || feedUrl
             }));
-        } catch (e) { return []; }
+            recordSourceHealth('job_rss', feed.title || feedUrl, true, items.length);
+            return items;
+        } catch (e) {
+            recordSourceHealth('job_rss', feedUrl, false, 0, summarizeModelError(e));
+            return [];
+        }
     });
 
     const boardJobs = await getBoardSourceJobs();
@@ -746,8 +913,12 @@ const getScrapedJobs = async (refreshRunId = null) => {
     // Deduplicate by URL
     const seen = new Set();
     const uniqueJobs = allRawJobs.filter(j => {
-        if (!j.url || seen.has(j.url)) return false;
-        seen.add(j.url);
+        if (j.sourcePublishedAt && !isRecentDate(j.sourcePublishedAt, JOB_MAX_AGE_DAYS)) return false;
+        if (!isLikelyPersistableJob(j)) return false;
+        const canonicalUrl = canonicalSourceUrl(j.url);
+        if (!canonicalUrl || seen.has(canonicalUrl)) return false;
+        j.url = canonicalUrl;
+        seen.add(canonicalUrl);
         return true;
     });
 
@@ -765,7 +936,10 @@ const getScrapedJobs = async (refreshRunId = null) => {
             company: j.company, title: j.title, location: j.location,
             url: j.url, isRemote: j.isRemote, time: j.time,
             source: j.source,
-            collectedAt: Date.now(),
+            sourcePublishedAt: j.sourcePublishedAt || null,
+            publishedAt: j.sourcePublishedAt || null,
+            collectedAt: getTimestamp(j.sourcePublishedAt),
+            freshness: j.sourcePublishedAt && isRecentDate(j.sourcePublishedAt, 1) ? 'breaking' : 'verified',
             refreshRunId,
             size: 0.4, color: "#00e676"
         });
@@ -784,6 +958,14 @@ const getScrapedNews = async (refreshRunId = null) => {
     console.log(`📡 Scraping news from ${NEWS_RSS_FEEDS.length} RSS + ${HN_QUERIES.length} HN queries...`);
     const news = [];
 
+    const dailyConfig = await getDailyNewsSources().catch(() => ({ feeds: [], mediumFeeds: [], googleNewsQueries: [] }));
+    const bridgeFeeds = [
+        ...(dailyConfig.feeds || []).map(item => item.url),
+        ...(dailyConfig.mediumFeeds || []),
+        ...(dailyConfig.googleNewsQueries || []).map(query => `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-IN&gl=IN&ceid=IN:en`),
+    ];
+    const allNewsFeeds = [...new Set([...NEWS_RSS_FEEDS, ...bridgeFeeds])];
+
     // 1. HackerNews multi-query
     const hnNews = await fetchBatched(HN_QUERIES, async (query) => {
         try {
@@ -798,26 +980,39 @@ const getScrapedNews = async (refreshRunId = null) => {
     });
 
     // 2. RSS feeds in batches
-    const rssNews = await fetchBatched(NEWS_RSS_FEEDS, async (feedUrl) => {
+    const rssNews = await fetchBatched(allNewsFeeds, async (feedUrl) => {
         try {
             const feed = await parser.parseURL(feedUrl);
             const cat = feedUrl.includes('arxiv') ? 'research' : feedUrl.includes('ai') || feedUrl.includes('machine') ? 'ai' : 'tech';
             const icon = cat === 'research' ? '🔬' : cat === 'ai' ? '🧠' : '📱';
-            return (feed.items || []).slice(0, 8).map(item => ({
+            const items = (feed.items || []).slice(0, 8).map(item => ({
                 headline: (item.title || '').replace(/<[^>]*>/g, '').trim(),
                 source: feed.title || 'RSS', url: item.link || '#',
                 category: cat, snippet: (item.contentSnippet || '').substring(0, 150).replace(/<[^>]*>/g, ''),
-                date: item.pubDate || new Date().toISOString(), icon
+                date: item.isoDate || item.pubDate || null, icon,
+                integration: bridgeFeeds.includes(feedUrl) ? 'DailyNewsUpdate' : 'native',
             }));
-        } catch (e) { return []; }
+            recordSourceHealth('news_rss', feed.title || feedUrl, true, items.length);
+            return items;
+        } catch (e) {
+            recordSourceHealth('news_rss', feedUrl, false, 0, summarizeModelError(e));
+            return [];
+        }
     });
 
-    const allRawNews = [...hnNews, ...rssNews];
+    const linkedInNews = await getLinkedInImports().catch(error => {
+        recordSourceHealth('linkedin', 'DailyNewsUpdate import', false, 0, error.message);
+        return [];
+    });
+    recordSourceHealth('linkedin', 'DailyNewsUpdate import', linkedInNews.length > 0, linkedInNews.length, linkedInNews.length ? null : 'authorization_or_import_required');
+    const allRawNews = [...hnNews, ...rssNews, ...linkedInNews];
     const candidateNews = allRawNews.filter(n => isRecentDate(n.date));
     const seen = new Set();
     const uniqueNews = sortByDateDesc(candidateNews).filter(n => {
-        if (!n.url || seen.has(n.url)) return false;
-        seen.add(n.url);
+        const canonicalUrl = canonicalSourceUrl(n.url);
+        if (!canonicalUrl || seen.has(canonicalUrl)) return false;
+        n.url = canonicalUrl;
+        seen.add(canonicalUrl);
         return true;
     });
 
@@ -832,8 +1027,17 @@ const getScrapedNews = async (refreshRunId = null) => {
             lat: hub.lat + (Math.random() - 0.5) * 0.1,
             lng: hub.lng + (Math.random() - 0.5) * 0.1,
             headline: n.headline, source: n.source, url: n.url,
+            category: n.category, snippet: n.snippet, integration: n.integration || 'native',
             time: "🔴 LIVE", collectedAt: Date.now(), refreshRunId, radius: 4.5, color: "#ff3333"
         });
+    });
+
+    news.forEach((point, index) => {
+        const sourceItem = uniqueNews[index];
+        point.time = sourceItem.date;
+        point.publishedAt = sourceItem.date;
+        point.collectedAt = getTimestamp(sourceItem.date);
+        point.freshness = isRecentDate(sourceItem.date, 1) ? 'breaking' : 'recent';
     });
 
     // Save to DB
@@ -991,6 +1195,8 @@ function parseYouTubeAgeDays(ago = '') {
 
 function normalizeYouTubeVideo(v, query) {
     const ageDays = parseYouTubeAgeDays(v.ago);
+    const publishedAt = toIsoOrNull(v.publishedAt || v.uploadDate)
+        || (ageDays < 999 ? new Date(Date.now() - ageDays * 24 * 60 * 60 * 1000).toISOString() : null);
     const refreshed = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
     return {
         title: v.title,
@@ -1000,6 +1206,7 @@ function normalizeYouTubeVideo(v, query) {
         ago: v.ago || 'recent',
         published: `${v.ago || 'recent'} • refreshed ${refreshed}`,
         publishedAgeDays: ageDays,
+        publishedAt,
         category: query.includes('AI') || query.includes('ai') || query.includes('machine') ? 'ai' :
             query.includes('startup') || query.includes('funding') ? 'startup' :
                 query.includes('cyber') || query.includes('hacking') ? 'security' :
@@ -1007,6 +1214,44 @@ function normalizeYouTubeVideo(v, query) {
                         query.includes('robot') || query.includes('quantum') ? 'hardware' :
                             query.includes('blockchain') || query.includes('web3') ? 'web3' : 'tech'
     };
+}
+
+async function getYouTubeApiVideos(queries) {
+    if (!process.env.YOUTUBE_API_KEY) return [];
+    const publishedAfter = new Date(Date.now() - VIDEO_MAX_AGE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    return fetchBatched(queries.slice(0, Math.min(queries.length, 12)), async (query) => {
+        try {
+            const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+                params: {
+                    key: process.env.YOUTUBE_API_KEY,
+                    part: 'snippet',
+                    q: query,
+                    type: 'video',
+                    order: 'date',
+                    publishedAfter,
+                    maxResults: 10,
+                    safeSearch: 'moderate',
+                },
+                timeout: API_TIMEOUT,
+            });
+            const items = (res.data?.items || []).map(item => ({
+                title: cleanText(item.snippet?.title),
+                videoId: item.id?.videoId,
+                channel: item.snippet?.channelTitle || 'YouTube',
+                views: 0,
+                ago: 'recent upload',
+                published: item.snippet?.publishedAt,
+                publishedAt: item.snippet?.publishedAt,
+                publishedAgeDays: Math.max(0, (Date.now() - getTimestamp(item.snippet?.publishedAt)) / 86_400_000),
+                category: /AI|machine|GPT|Gemini/i.test(query) ? 'ai' : 'tech',
+            })).filter(item => item.videoId && item.publishedAt);
+            recordSourceHealth('youtube_api', query, true, items.length);
+            return items;
+        } catch (error) {
+            recordSourceHealth('youtube_api', query, false, 0, summarizeModelError(error));
+            return [];
+        }
+    }, 3);
 }
 
 function withTimeout(promise, ms, fallback) {
@@ -1028,26 +1273,25 @@ const getYouTubeVideos = async () => {
     console.log(`🎥 Scraping YouTube with ${allQueries.length} queries...`);
 
     const videos = [];
-    const overflowVideos = [];
     const uniqueIds = new Set();
 
-    const fetchVideos = await fetchBatched(allQueries, async (query) => {
+    const apiVideos = await getYouTubeApiVideos(allQueries);
+    const searchVideos = await fetchBatched(allQueries, async (query) => {
         try {
             const r = await withTimeout(ytSearch(query), API_TIMEOUT, { videos: [] });
             return (r.videos || []).slice(0, 10).map(v => normalizeYouTubeVideo(v, query));
         } catch (e) { return []; }
     }, 5); // batch 5 at a time to avoid rate limits
 
-    fetchVideos.forEach(v => {
+    [...apiVideos, ...searchVideos].forEach(v => {
         if (v.videoId && !uniqueIds.has(v.videoId)) {
             uniqueIds.add(v.videoId);
-            if (v.publishedAgeDays <= VIDEO_MAX_AGE_DAYS) videos.push(v);
-            else overflowVideos.push(v);
+            if (v.publishedAt && v.publishedAgeDays <= VIDEO_MAX_AGE_DAYS) videos.push(v);
         }
     });
 
-    const selectedVideos = (videos.length >= 12 ? videos : [...videos, ...overflowVideos])
-        .sort((a, b) => (a.publishedAgeDays - b.publishedAgeDays) || ((b.views || 0) - (a.views || 0)))
+    const selectedVideos = videos
+        .sort((a, b) => getTimestamp(b.publishedAt) - getTimestamp(a.publishedAt) || ((b.views || 0) - (a.views || 0)))
         .slice(0, 60);
     await saveVideosToNeonDB(selectedVideos);
     console.log(`✅ YouTube: ${selectedVideos.length} fresh videos from ${allQueries.length} queries`);
@@ -1069,6 +1313,15 @@ async function cleanupKnownJobNoise() {
             DELETE FROM jobs
             WHERE LOWER(TRIM(COALESCE(title, ''))) IN ('software development','content writing','consulting','business consulting','business analysis','debugging','agile development','project management','prototyping','mobile app development','web development','data management','international jobs','marketing','data entry','translation','research','training','design','testing','advisories for international jobseeker','international resources','post international jobs','ncs meta data','international job opportunities');
         `);
+        await pool.query(`
+            DELETE FROM jobs
+            WHERE source = ANY($1::text[])
+              AND (
+                LOWER(COALESCE(title, '')) ~ '(join now|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|privacy|terms|about us|contact us|sign in|login)'
+                OR LOWER(COALESCE(title, '')) !~ '(engineer|developer|architect|analyst|scientist|specialist|consultant|manager|designer|writer|administrator|officer|executive|associate|assistant|trainee|intern|operator|technician|accountant|recruiter|sales|support|nurse|teacher|lead|director|head|python|react|node|java|golang|devops|full.?stack|front.?end|back.?end|software|cloud|security|machine learning|data)'
+                OR LOWER(COALESCE(url, '')) !~ '(\/jobs?\/view\/([0-9]+)|\/job\/|job[_-]?id=|jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(y|ies)\/|\/project\/[0-9]+)'
+              );
+        `, [JOB_BOARD_SOURCES.map(source => source.name)]);
         await pool.query(`
             DELETE FROM jobs older
             USING jobs newer
@@ -1092,12 +1345,12 @@ const saveJobsToNeonDB = async (jobsArr, refreshRunId = null) => {
         const chunk = jobsArr.slice(i, i + 50);
         const values = []; const placeholders = []; let c = 1;
         for (const j of chunk) {
-            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},'open',NOW(),$${c++})`);
-            values.push(j.title, j.company, j.url, j.source || j.time, j.location || 'Remote', j.pay || 'N/A', new Date().toISOString(), refreshRunId);
+            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},'open',NOW(),NOW(),NOW(),$${c++})`);
+            values.push(j.title, j.company, j.url, j.source || j.time, j.location || 'Remote', j.pay || 'N/A', j.sourcePublishedAt, j.sourcePublishedAt, refreshRunId);
         }
         try {
             await pool.query(`
-                INSERT INTO jobs (title,company,url,source,location,pay,posted_date,status,refreshed_at,refresh_run_id)
+                INSERT INTO jobs (title,company,url,source,location,pay,posted_date,source_published_at,status,first_seen_at,last_seen_at,refreshed_at,refresh_run_id)
                 VALUES ${placeholders.join(',')}
                 ON CONFLICT (url) DO UPDATE SET
                     title = EXCLUDED.title,
@@ -1105,7 +1358,9 @@ const saveJobsToNeonDB = async (jobsArr, refreshRunId = null) => {
                     source = EXCLUDED.source,
                     location = EXCLUDED.location,
                     pay = EXCLUDED.pay,
-                    posted_date = EXCLUDED.posted_date,
+                    posted_date = COALESCE(EXCLUDED.posted_date, jobs.posted_date),
+                    source_published_at = COALESCE(EXCLUDED.source_published_at, jobs.source_published_at),
+                    last_seen_at = NOW(),
                     refreshed_at = NOW(),
                     refresh_run_id = EXCLUDED.refresh_run_id;
             `, values);
@@ -1121,19 +1376,21 @@ const saveNewsToNeonDB = async (newsArr, refreshRunId = null) => {
         const chunk = newsArr.slice(i, i + 50);
         const values = []; const placeholders = []; let c = 1;
         for (const n of chunk) {
-            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},NOW(),$${c++})`);
-            values.push(n.headline, n.source, n.url, n.category || 'tech', n.snippet || '', n.date || new Date().toISOString(), refreshRunId);
+            placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++},NOW(),NOW(),NOW(),$${c++})`);
+            values.push(n.headline, n.source, n.url, n.category || 'tech', n.snippet || '', n.date, n.date, refreshRunId);
         }
         try {
             await pool.query(`
-                INSERT INTO news (headline,source,url,category,snippet,published_date,refreshed_at,refresh_run_id)
+                INSERT INTO news (headline,source,url,category,snippet,published_date,source_published_at,first_seen_at,last_seen_at,refreshed_at,refresh_run_id)
                 VALUES ${placeholders.join(',')}
                 ON CONFLICT (url) DO UPDATE SET
                     headline = EXCLUDED.headline,
                     source = EXCLUDED.source,
                     category = EXCLUDED.category,
                     snippet = EXCLUDED.snippet,
-                    published_date = EXCLUDED.published_date,
+                    published_date = COALESCE(EXCLUDED.published_date, news.published_date),
+                    source_published_at = COALESCE(EXCLUDED.source_published_at, news.source_published_at),
+                    last_seen_at = NOW(),
                     refreshed_at = NOW(),
                     refresh_run_id = EXCLUDED.refresh_run_id;
             `, values);
@@ -1145,12 +1402,12 @@ const saveVideosToNeonDB = async (vids) => {
     if (!pool || vids.length === 0) return;
     const values = []; const placeholders = []; let c = 1;
     for (const v of vids) {
-        placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++})`);
-        values.push(v.title, v.videoId, v.channel, v.published, Number(v.views || 0), v.ago || v.published || 'recent');
+        placeholders.push(`($${c++},$${c++},$${c++},$${c++},$${c++},$${c++},$${c++})`);
+        values.push(v.title, v.videoId, v.channel, v.published, Number(v.views || 0), v.ago || v.published || 'recent', v.publishedAt || null);
     }
     try {
         await pool.query(`
-            INSERT INTO youtube_videos (title,video_id,channel,published,views,published_ago)
+            INSERT INTO youtube_videos (title,video_id,channel,published,views,published_ago,published_at)
             VALUES ${placeholders.join(',')}
             ON CONFLICT (video_id) DO UPDATE SET
                 title = EXCLUDED.title,
@@ -1158,6 +1415,7 @@ const saveVideosToNeonDB = async (vids) => {
                 published = EXCLUDED.published,
                 views = EXCLUDED.views,
                 published_ago = EXCLUDED.published_ago,
+                published_at = COALESCE(EXCLUDED.published_at, youtube_videos.published_at),
                 refreshed_at = NOW();
         `, values);
     } catch (e) { /* skip */ }
@@ -1432,10 +1690,21 @@ async function refreshVideosIfNeeded(force = false) {
     cache.videoLastStarted = Date.now();
     videoRefreshPromise = (async () => {
         const freshVideos = await getYouTubeVideos();
-        if (freshVideos?.length) {
-            cache.videos = freshVideos;
-            cache.videoLastRefresh = Date.now();
-        }
+        const recentCached = (cache.videos || []).map(video => ({
+            ...video,
+            videoId: video.videoId || video.video_id,
+            publishedAt: video.publishedAt || video.published_at,
+        })).filter(video => video.videoId && isRecentDate(video.publishedAt, VIDEO_MAX_AGE_DAYS));
+        const seen = new Set();
+        cache.videos = [...(freshVideos || []), ...recentCached]
+            .filter(video => {
+                if (!video.videoId || seen.has(video.videoId)) return false;
+                seen.add(video.videoId);
+                return true;
+            })
+            .sort((a, b) => getTimestamp(b.publishedAt) - getTimestamp(a.publishedAt))
+            .slice(0, 60);
+        cache.videoLastRefresh = Date.now();
         return cache.videos || [];
     })();
     try {
@@ -1464,7 +1733,7 @@ async function refreshAllData() {
             const [dbJobs, dbNews, dbVids] = await Promise.all([
                 pool.query('SELECT * FROM jobs ORDER BY COALESCE(refreshed_at, created_at) DESC LIMIT 500'),
                 pool.query('SELECT * FROM news ORDER BY COALESCE(refreshed_at, created_at) DESC LIMIT 500'),
-                pool.query('SELECT * FROM youtube_videos ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC LIMIT 60')
+                pool.query('SELECT * FROM youtube_videos WHERE published_at >= NOW() - $1::interval ORDER BY published_at DESC, id DESC LIMIT 60', [`${VIDEO_MAX_AGE_DAYS} days`])
             ]);
 
             if (dbJobs.rows.length > 0 || dbNews.rows.length > 0) {
@@ -1595,6 +1864,76 @@ app.post('/api/ai-modes', (req, res) => {
     aiMode = requested;
     aiRuntime.disabledUntil = 0;
     res.json(getAIModePayload());
+});
+
+app.get('/api/free-models', async (req, res) => {
+    const [ollama, bridge] = await Promise.all([inspectOllama(), getDailyNewsBridgeStatus()]);
+    const huggingFaceToken = process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
+    res.json({
+        activeMode: aiMode,
+        providers: [
+            {
+                id: 'ollama',
+                name: 'Ollama',
+                kind: 'local',
+                configured: true,
+                reachable: ollama.reachable,
+                endpoint: ollama.endpoint,
+                models: OLLAMA_MODELS.map(id => ({ id, installed: ollama.installed.includes(id) })),
+                installed: ollama.installed,
+                note: ollama.reachable ? 'Private local inference is ready.' : 'Start Ollama locally or configure OLLAMA_BASE_URL on a reachable host.',
+            },
+            {
+                id: 'openrouter',
+                name: 'OpenRouter Free',
+                kind: 'hosted',
+                configured: getOpenRouterTokens().length > 0,
+                reachable: getOpenRouterTokens().length > 0,
+                models: OPENROUTER_MODELS.map(id => ({ id, installed: true })),
+                note: 'Free-model router with automatic per-model fallback.',
+            },
+            {
+                id: 'huggingface',
+                name: 'Hugging Face Inference',
+                kind: 'hosted',
+                configured: Boolean(huggingFaceToken),
+                reachable: Boolean(huggingFaceToken),
+                models: HUGGINGFACE_MODELS.map(id => ({ id, installed: true })),
+                note: huggingFaceToken ? 'Open-source hosted inference is configured.' : 'Set HUGGINGFACE_API_KEY or HF_TOKEN to enable hosted inference.',
+            },
+        ],
+        routing: ['Ollama local', 'Hugging Face', 'OpenRouter free', 'deterministic offline fallback'],
+        lastRuntime: getAIModePayload().runtime,
+        dailyNewsUpdate: bridge,
+    });
+});
+
+app.get('/api/integrations', async (req, res) => {
+    const bridge = await getDailyNewsBridgeStatus();
+    res.json({
+        dailyNewsUpdate: bridge,
+        linkedin: {
+            connected: bridge.connected && bridge.linkedInImports > 0,
+            items: bridge.linkedInImports || 0,
+            mode: 'authorized_feed_or_import',
+            requiredPath: 'smart_job_portal/daily_news_updater/data/imports/linkedin.json',
+        },
+        youtube: {
+            apiConfigured: Boolean(process.env.YOUTUBE_API_KEY),
+            oauthConfigured: Boolean(process.env.YOUTUBE_REFRESH_TOKEN && process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET),
+            maxAgeDays: VIDEO_MAX_AGE_DAYS,
+        },
+    });
+});
+
+app.get('/api/source-health', (req, res) => {
+    const sources = [...sourceHealth.values()].sort((a, b) => String(b.checkedAt).localeCompare(String(a.checkedAt)));
+    res.json({
+        checked: sources.length,
+        healthy: sources.filter(item => item.ok).length,
+        failing: sources.filter(item => !item.ok).length,
+        sources,
+    });
 });
 
 app.get('/api/source-registry', (req, res) => {
@@ -2129,7 +2468,7 @@ app.get('/api/stats', (req, res) => res.json({ ...cache.stats, health: getServic
 // ═══════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════
-const PORT = 8000;
+const PORT = Number(process.env.PORT || 8000);
 app.listen(PORT, async () => {
     console.log(`\n🚀 Smart News & Job Tracker Backend on port ${PORT}`);
     console.log(`📊 Job Sources: ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS + ${JOB_BOARD_SOURCES.length} boards = ${getTotalJobSources()} total`);

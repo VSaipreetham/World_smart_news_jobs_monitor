@@ -6,6 +6,10 @@ import {
   Bot,
   Briefcase,
   Building2,
+  Clock3,
+  Cloud,
+  Compass,
+  Cpu,
   Database,
   ExternalLink,
   Filter,
@@ -15,12 +19,16 @@ import {
   Newspaper,
   Play,
   RefreshCcw,
+  Route,
   Search,
   ShieldCheck,
+  Server,
   Sparkles,
+  Target,
   TrendingUp,
   Upload,
   Video,
+  Zap,
   X,
 } from 'lucide-react';
 import './App.css';
@@ -28,6 +36,32 @@ import './App.css';
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 const FEED_LIMIT = 80;
 const PORTAL_LIMIT = 18;
+
+const API_BASES = [
+  API_BASE,
+  API_BASE ? '' : null,
+  import.meta.env.DEV ? 'http://127.0.0.1:8000' : null,
+].filter((base, index, items) => base !== null && items.indexOf(base) === index);
+
+function apiUrl(path, base = API_BASES[0] || '') {
+  return `${base}${path}`;
+}
+
+async function apiFetch(path, options) {
+  let lastResponse = null;
+  let lastError = null;
+  for (const base of API_BASES) {
+    try {
+      const response = await fetch(apiUrl(path, base), options);
+      if (response.ok) return response;
+      lastResponse = response;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastResponse) return lastResponse;
+  throw lastError || new Error('api_unavailable');
+}
 
 function formatAge(seconds) {
   if (seconds == null) return 'waiting';
@@ -141,14 +175,20 @@ export default function App() {
   const [aiMode, setAiMode] = useState('auto');
   const [aiModes, setAiModes] = useState([]);
   const [sourceRegistry, setSourceRegistry] = useState(null);
+  const [freeModels, setFreeModels] = useState(null);
+  const [integrations, setIntegrations] = useState(null);
+  const [sourceHealth, setSourceHealth] = useState(null);
   const [resumeFileName, setResumeFileName] = useState('');
   const [aiAttribution, setAiAttribution] = useState({});
   const [globeMode, setGlobeMode] = useState('opportunity');
 
   const fetchOperationalConfig = useCallback(async () => {
-    const [modesRes, sourcesRes] = await Promise.allSettled([
-      fetch(`${API_BASE}/api/ai-modes`),
-      fetch(`${API_BASE}/api/source-registry`),
+    const [modesRes, sourcesRes, modelsRes, integrationsRes, healthRes] = await Promise.allSettled([
+      apiFetch('/api/ai-modes'),
+      apiFetch('/api/source-registry'),
+      apiFetch('/api/free-models'),
+      apiFetch('/api/integrations'),
+      apiFetch('/api/source-health'),
     ]);
     if (modesRes.status === 'fulfilled' && modesRes.value.ok) {
       const json = await modesRes.value.json();
@@ -158,44 +198,50 @@ export default function App() {
     if (sourcesRes.status === 'fulfilled' && sourcesRes.value.ok) {
       setSourceRegistry(await sourcesRes.value.json());
     }
+    if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) setFreeModels(await modelsRes.value.json());
+    if (integrationsRes.status === 'fulfilled' && integrationsRes.value.ok) setIntegrations(await integrationsRes.value.json());
+    if (healthRes.status === 'fulfilled' && healthRes.value.ok) setSourceHealth(await healthRes.value.json());
   }, []);
 
   const fetchDashboard = useCallback(async () => {
-    const [dashRes, trendsRes, aiRes, healthRes, videosRes] = await Promise.allSettled([
-      fetch(`${API_BASE}/api/dashboard-data`),
-      fetch(`${API_BASE}/api/latest-trends`),
-      fetch(`${API_BASE}/api/ai-insights`),
-      fetch(`${API_BASE}/api/health`),
-      fetch(`${API_BASE}/api/videos?refresh=1`),
-    ]);
-
-    if (dashRes.status === 'fulfilled' && dashRes.value.ok) {
-      const json = await dashRes.value.json();
+    const dashPromise = apiFetch('/api/dashboard-data').then(async (res) => {
+      if (!res.ok) return;
+      const json = await res.json();
       setData(json.data || []);
+      setVideos(normalizeVideos(json.videos || []));
+      setTrends(json.trends || []);
       setStats(json.stats || {});
       setHealth(json.health || null);
-    }
-    if (trendsRes.status === 'fulfilled' && trendsRes.value.ok) {
-      const json = await trendsRes.value.json();
-      setTrends(json.trends || []);
-    }
-    if (aiRes.status === 'fulfilled' && aiRes.value.ok) {
-      const json = await aiRes.value.json();
-      setInsight(json);
-      setAiAttribution((current) => ({
-        ...current,
-        insight: { provider: json.provider, model: json.model, fallback: json.fallback },
-      }));
-      setVideos(normalizeVideos(json.videos || []));
-    }
-    if (videosRes.status === 'fulfilled' && videosRes.value.ok) {
-      const json = await videosRes.value.json();
-      if (json.videos?.length) setVideos(normalizeVideos(json.videos));
-    }
-    if (healthRes.status === 'fulfilled') {
-      const json = await healthRes.value.json().catch(() => null);
+    });
+    const healthPromise = apiFetch('/api/health').then(async (res) => {
+      const json = await res.json().catch(() => null);
       if (json) setHealth(json);
-    }
+    });
+
+    await Promise.allSettled([dashPromise, healthPromise]);
+
+    Promise.allSettled([
+      apiFetch('/api/latest-trends').then(async (res) => {
+        if (!res.ok) return;
+        const json = await res.json();
+        setTrends(json.trends || []);
+      }),
+      apiFetch('/api/ai-insights').then(async (res) => {
+        if (!res.ok) return;
+        const json = await res.json();
+        setInsight(json);
+        setAiAttribution((current) => ({
+          ...current,
+          insight: { provider: json.provider, model: json.model, fallback: json.fallback },
+        }));
+        setVideos(normalizeVideos(json.videos || []));
+      }),
+      apiFetch('/api/videos').then(async (res) => {
+        if (!res.ok) return;
+        const json = await res.json();
+        if (json.videos?.length) setVideos(normalizeVideos(json.videos));
+      }),
+    ]);
   }, []);
 
   useEffect(() => {
@@ -219,7 +265,7 @@ export default function App() {
   const forceRefresh = async () => {
     setIsRefreshing(true);
     try {
-      const res = await fetch(`${API_BASE}/api/refresh`, { method: 'POST' });
+      const res = await apiFetch('/api/refresh', { method: 'POST' });
       const json = await res.json().catch(() => null);
       if (json?.data) setData(json.data || []);
       if (json?.trends) setTrends(json.trends || []);
@@ -251,7 +297,7 @@ export default function App() {
       search,
       status,
     });
-    const res = await fetch(`${API_BASE}/api/portal-jobs?${params.toString()}`);
+    const res = await apiFetch(`/api/portal-jobs?${params.toString()}`);
     const json = await res.json();
     setPortalJobs(json.jobs || []);
     setPortalTotal(json.total || 0);
@@ -259,13 +305,13 @@ export default function App() {
   };
 
   const fetchPortalAnalytics = async () => {
-    const res = await fetch(`${API_BASE}/api/portal-analytics`);
+    const res = await apiFetch('/api/portal-analytics');
     if (res.ok) setPortalAnalytics(await res.json());
   };
 
   const changeAiMode = async (modeId) => {
     setAiMode(modeId);
-    const res = await fetch(`${API_BASE}/api/ai-modes`, {
+    const res = await apiFetch('/api/ai-modes', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: modeId }),
@@ -287,7 +333,7 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append('resume', file);
-      const res = await fetch(`${API_BASE}/api/portal-resume-upload`, {
+      const res = await apiFetch('/api/portal-resume-upload', {
         method: 'POST',
         body: formData,
       });
@@ -309,7 +355,7 @@ export default function App() {
   };
 
   const updatePortalJob = async (job, patch) => {
-    const res = await fetch(`${API_BASE}/api/portal-jobs/${job.id}`, {
+    const res = await apiFetch(`/api/portal-jobs/${job.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
@@ -323,7 +369,7 @@ export default function App() {
   };
 
   const deletePortalJob = async (job) => {
-    const res = await fetch(`${API_BASE}/api/portal-jobs/${job.id}`, { method: 'DELETE' });
+    const res = await apiFetch(`/api/portal-jobs/${job.id}`, { method: 'DELETE' });
     if (res.ok) {
       setPortalJobs((items) => items.filter((item) => item.id !== job.id));
       setSelectedPortalJob(null);
@@ -336,7 +382,7 @@ export default function App() {
     setPortalBusy(true);
     setBusyLabel('Ranking jobs with Agentic RAG');
     try {
-      const res = await fetch(`${API_BASE}/api/portal-rank-resume`, {
+      const res = await apiFetch('/api/portal-rank-resume', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resumeText, limit: 20 }),
@@ -360,7 +406,7 @@ export default function App() {
     setBusyLabel('Running Agentic RAG coach');
     setAgentAnswer('');
     try {
-      const res = await fetch(`${API_BASE}/api/portal-agentic-rag`, {
+      const res = await apiFetch('/api/portal-agentic-rag', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resumeText, question: agentQuestion }),
@@ -391,7 +437,7 @@ export default function App() {
     setBusyLabel('Generating AI toolkit output');
     setToolkitOutput('');
     try {
-      const res = await fetch(`${API_BASE}/api/portal-ai-toolkit`, {
+      const res = await apiFetch('/api/portal-ai-toolkit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jobId: selectedPortalJob.id, type, resumeText }),
@@ -413,7 +459,7 @@ export default function App() {
     setPortalBusy(true);
     setBusyLabel('Analyzing market with RAG');
     try {
-      const res = await fetch(`${API_BASE}/api/portal-market-query`, {
+      const res = await apiFetch('/api/portal-market-query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: marketQuestion, resumeText }),
@@ -433,26 +479,39 @@ export default function App() {
   const jobs = useMemo(() => data.filter((item) => item.type === 'job'), [data]);
   const news = useMemo(() => data.filter((item) => item.type === 'news'), [data]);
 
-  const filteredFeed = useMemo(() => {
+  const matchesQuery = useCallback((item, lower) => {
+    if (!lower) return true;
+    return [item.title, item.headline, item.company, item.source, item.location]
+      .filter(Boolean)
+      .some((value) => value.toLowerCase().includes(lower));
+  }, []);
+
+  const scopedSignals = useMemo(() => {
     const lower = query.trim().toLowerCase();
     return data
       .filter((item) => mode === 'all' || item.type === mode)
-      .filter((item) => {
-        if (!lower) return true;
-        return [item.title, item.headline, item.company, item.source, item.location]
-          .filter(Boolean)
-          .some((value) => value.toLowerCase().includes(lower));
-      })
-      .slice(0, FEED_LIMIT);
-  }, [data, mode, query]);
+      .filter((item) => matchesQuery(item, lower));
+  }, [data, matchesQuery, mode, query]);
 
-  const globeJobs = useMemo(() => filteredFeed.filter((item) => item.type === 'job'), [filteredFeed]);
-  const globeNews = useMemo(() => filteredFeed.filter((item) => item.type === 'news'), [filteredFeed]);
+  const scopedJobs = useMemo(() => {
+    const lower = query.trim().toLowerCase();
+    return jobs.filter((item) => matchesQuery(item, lower));
+  }, [jobs, matchesQuery, query]);
+
+  const scopedNews = useMemo(() => {
+    const lower = query.trim().toLowerCase();
+    return news.filter((item) => matchesQuery(item, lower));
+  }, [matchesQuery, news, query]);
+
+  const filteredFeed = useMemo(() => scopedSignals.slice(0, FEED_LIMIT), [scopedSignals]);
+
+  const globeJobs = useMemo(() => scopedJobs.slice(0, FEED_LIMIT), [scopedJobs]);
+  const globeNews = useMemo(() => scopedNews.slice(0, FEED_LIMIT), [scopedNews]);
   const globeSignals = useMemo(() => {
     if (globeMode === 'jobs') return globeJobs;
     if (globeMode === 'news') return globeNews;
-    return filteredFeed;
-  }, [filteredFeed, globeJobs, globeMode, globeNews]);
+    return scopedSignals;
+  }, [globeJobs, globeMode, globeNews, scopedSignals]);
   const globeClusters = useMemo(() => {
     const map = new Map();
     globeSignals.forEach((item) => {
@@ -511,6 +570,78 @@ export default function App() {
       routes: opportunityArcs.length,
     };
   }, [globeClusters, globeSignals, opportunityArcs.length]);
+  const worldCommand = useMemo(() => {
+    const countBy = (items, getter, limit = 6) => [...items.reduce((map, item) => {
+      const label = getter(item) || 'Unknown';
+      map.set(label, (map.get(label) || 0) + 1);
+      return map;
+    }, new Map()).entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([label, count]) => ({ label, count }));
+    const remoteJobs = jobs.filter((job) => /remote|anywhere|global|worldwide/i.test(`${job.location || ''} ${job.title || ''}`));
+    const aiJobs = jobs.filter((job) => /ai|machine learning|ml|rag|llm|data scientist|genai/i.test(`${job.title || ''} ${job.company || ''}`));
+    const freshNews = news.filter((item) => item.collectedAt && Date.now() - item.collectedAt < 24 * 60 * 60 * 1000);
+    const recentSignals = [...scopedSignals]
+      .sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0))
+      .slice(0, 7);
+    const roleFamilies = [
+      { label: 'AI / ML', count: aiJobs.length, query: 'ai', tone: 'blue' },
+      { label: 'Remote', count: remoteJobs.length, query: 'remote', tone: 'green' },
+      { label: 'Cloud', count: jobs.filter((job) => /cloud|devops|aws|azure|gcp|platform/i.test(job.title || '')).length, query: 'cloud', tone: 'violet' },
+      { label: 'Frontend', count: jobs.filter((job) => /react|frontend|ui|javascript|web/i.test(job.title || '')).length, query: 'react', tone: 'amber' },
+    ];
+    return {
+      missions: [
+        {
+          id: 'hotspot',
+          icon: Target,
+          label: 'Hotspot',
+          value: radarSummary.hotspot,
+          detail: `${radarSummary.hotspotCount} live signals`,
+          query: radarSummary.hotspot,
+          mode: 'opportunity',
+        },
+        {
+          id: 'remote',
+          icon: Compass,
+          label: 'Remote hunt',
+          value: remoteJobs.length,
+          detail: `${Math.round((remoteJobs.length / Math.max(jobs.length, 1)) * 100)}% of tracked jobs`,
+          query: 'remote',
+          mode: 'jobs',
+        },
+        {
+          id: 'ai',
+          icon: Zap,
+          label: 'AI lane',
+          value: aiJobs.length,
+          detail: 'AI, ML, RAG, LLM roles',
+          query: 'ai',
+          mode: 'jobs',
+        },
+        {
+          id: 'routes',
+          icon: Route,
+          label: 'News -> jobs',
+          value: opportunityArcs.length,
+          detail: `${freshNews.length} fresh news signals`,
+          query: '',
+          mode: 'opportunity',
+        },
+      ],
+      roleFamilies,
+      sourceMix: countBy(scopedSignals, (item) => item.company || item.source, 7),
+      corridors: globeClusters.slice(0, 6),
+      recentSignals,
+      totals: {
+        jobs: jobs.length,
+        news: news.length,
+        freshNews: freshNews.length,
+        sources: countBy(scopedSignals, (item) => item.company || item.source, 1000).length,
+      },
+    };
+  }, [globeClusters, jobs, news, opportunityArcs.length, radarSummary.hotspot, radarSummary.hotspotCount, scopedSignals]);
   const freshTone = health?.lastError ? 'danger' : health?.isRefreshing ? 'warn' : 'good';
   const aiLabel = health?.ai?.available === false
     ? 'cooldown'
@@ -543,15 +674,21 @@ export default function App() {
         <div className="brand-lockup">
           <Globe2 size={26} />
           <div>
-            <h1>World Signal Monitor</h1>
-            <p>News, jobs, video signals, and AI briefing</p>
+            <h1>World Intelligence Desk</h1>
+            <p>Verified opportunity and technology signals</p>
           </div>
         </div>
+        <nav className="desk-nav" aria-label="Workspace">
+          <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}><Globe2 size={15} /> World</button>
+          <button onClick={async () => { await openPortal(); setPortalTab('models'); }}><Cpu size={15} /> Free models</button>
+          <button onClick={openPortal}><Briefcase size={15} /> Career desk</button>
+        </nav>
         <div className="topbar-actions">
           <span className={`status-pill ${freshTone}`}>
             <Activity size={15} />
             {health?.isRefreshing ? 'Refreshing' : health?.lastError ? 'Degraded' : 'Live'}
           </span>
+          <span className="data-age">updated {formatAge(health?.ageSeconds)}</span>
           <button className="icon-button" onClick={forceRefresh} disabled={isRefreshing} title="Refresh data">
             <RefreshCcw size={18} className={isRefreshing ? 'spin' : ''} />
           </button>
@@ -685,10 +822,113 @@ export default function App() {
           </aside>
         </section>
 
+        <section className="world-command">
+          <div className="world-command-head">
+            <div>
+              <span className="section-kicker"><Globe2 size={15} /> World Command</span>
+              <h2>Global Opportunity Intelligence</h2>
+            </div>
+            <div className="world-scoreboard">
+              <span>{worldCommand.totals.jobs} jobs</span>
+              <span>{worldCommand.totals.news} news</span>
+              <span>{worldCommand.totals.sources} sources</span>
+              <span>{worldCommand.totals.freshNews} fresh</span>
+            </div>
+          </div>
+
+          <div className="mission-grid">
+            {worldCommand.missions.map((mission) => {
+              const Icon = mission.icon;
+              return (
+                <button
+                  className="mission-card"
+                  key={mission.id}
+                  onClick={() => {
+                    setGlobeMode(mission.mode);
+                    setMode(mission.mode === 'news' ? 'news' : mission.mode === 'jobs' ? 'job' : 'all');
+                    setQuery(mission.query || '');
+                  }}
+                >
+                  <Icon size={18} />
+                  <span>{mission.label}</span>
+                  <strong>{mission.value}</strong>
+                  <small>{mission.detail}</small>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="world-intel-grid">
+            <div className="world-panel corridor-panel">
+              <div className="world-panel-head">
+                <h3><Route size={17} /> Market Corridors</h3>
+                <span>{opportunityArcs.length} routes</span>
+              </div>
+              <div className="corridor-list">
+                {worldCommand.corridors.map((cluster) => {
+                  const max = Math.max(...worldCommand.corridors.map((item) => item.count || 0), 1);
+                  return (
+                    <button key={cluster.label} onClick={() => { setQuery(cluster.label); setGlobeMode('opportunity'); }}>
+                      <span>
+                        <strong>{cluster.label}</strong>
+                        <em>{cluster.sourceCount} sources - {cluster.fresh} fresh</em>
+                        <i style={{ width: `${Math.max(10, Math.round((cluster.count / max) * 100))}%` }} />
+                      </span>
+                      <b>{cluster.jobs}J / {cluster.news}N</b>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="world-panel role-panel">
+              <div className="world-panel-head">
+                <h3><Target size={17} /> Opportunity Lanes</h3>
+                <span>{worldCommand.roleFamilies.reduce((sum, row) => sum + row.count, 0)} matches</span>
+              </div>
+              <div className="lane-grid">
+                {worldCommand.roleFamilies.map((lane) => (
+                  <button className={`lane-card ${lane.tone}`} key={lane.label} onClick={() => { setMode('job'); setGlobeMode('jobs'); setQuery(lane.query); }}>
+                    <span>{lane.label}</span>
+                    <strong>{lane.count}</strong>
+                  </button>
+                ))}
+              </div>
+              <div className="source-mix">
+                {worldCommand.sourceMix.slice(0, 5).map((source) => (
+                  <button key={source.label} onClick={() => setQuery(source.label)}>
+                    <span>{source.label}</span>
+                    <strong>{source.count}</strong>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="world-panel timeline-panel">
+              <div className="world-panel-head">
+                <h3><Clock3 size={17} /> Live Storyline</h3>
+                <span>{formatAge(health?.ageSeconds)}</span>
+              </div>
+              <div className="signal-timeline">
+                {worldCommand.recentSignals.map((signal) => (
+                  <button key={signal.id || signal.url} onClick={() => setSelectedPoint(signal)}>
+                    <i className={signal.type} />
+                    <span>
+                      <strong>{signal.title || signal.headline}</strong>
+                      <em>{signal.company || signal.source || 'Source'} - {signal.location || 'Global'}</em>
+                    </span>
+                    <small>{signal.collectedAt ? formatDateAge(signal.collectedAt) : signal.time || 'live'}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section className="content-grid">
           <div className="workspace wide">
             <div className="workspace-header">
-              <h2><Layers size={19} /> Signal Feed</h2>
+              <h2><Layers size={19} /> Fresh Evidence</h2>
               <span>{filteredFeed.length} visible</span>
             </div>
             <div className="feed-list">
@@ -701,7 +941,9 @@ export default function App() {
                     <strong>{item.title || item.headline}</strong>
                     <small>{item.company || item.source || 'Source'} - {item.location || 'Global'}</small>
                   </span>
-                  <span className="feed-time">{item.collectedAt ? formatDateAge(item.collectedAt) : (item.time || 'live')}</span>
+                  <span className={`feed-time ${item.freshness || 'verified'}`}>
+                    <i /> {item.publishedAt || item.collectedAt ? formatDateAge(item.publishedAt || item.collectedAt) : 'verified now'}
+                  </span>
                 </button>
               ))}
             </div>
@@ -736,7 +978,7 @@ export default function App() {
                   <img src={`https://img.youtube.com/vi/${video.videoId}/mqdefault.jpg`} alt="" loading="lazy" />
                   <span>
                     <strong>{video.title}</strong>
-                    <small><Play size={12} /> {video.channel || 'YouTube'} - {video.published || video.published_ago || 'freshly checked'}</small>
+                    <small><Play size={12} /> {video.channel || 'YouTube'} - {formatDateAge(video.publishedAt || video.published_at)}</small>
                   </span>
                 </a>
               ))}
@@ -819,12 +1061,13 @@ export default function App() {
                 ['analytics', 'Analytics'],
                 ['coach', 'Resume AI'],
                 ['market', 'Market Q&A'],
+                ['models', 'Free Models'],
               ].map(([id, label]) => (
                 <button key={id} className={portalTab === id ? 'active' : ''} onClick={() => setPortalTab(id)}>{label}</button>
               ))}
-              <a href={`${API_BASE}/api/portal-export.csv`} className="export-link">Export CSV</a>
+              <a href={apiUrl('/api/portal-export.csv')} className="export-link">Export CSV</a>
             </div>
-            <div className="portal-search">
+            {(portalTab === 'inbox' || portalTab === 'applications') && <div className="portal-search">
               <div className="search-box">
                 <Search size={16} />
                 <input
@@ -842,7 +1085,7 @@ export default function App() {
               <button className="icon-button" onClick={() => fetchPortalJobs(1, portalQuery, portalStatus)} title="Search">
                 <Search size={17} />
               </button>
-            </div>
+            </div>}
 
             {(portalTab === 'inbox' || portalTab === 'applications') && (
               <div className="portal-workbench">
@@ -946,6 +1189,70 @@ export default function App() {
               </div>
             )}
 
+            {portalTab === 'models' && (
+              <div className="model-control-room">
+                <div className="model-room-header">
+                  <div>
+                    <span className="section-kicker"><Cpu size={15} /> Open Model Runtime</span>
+                    <h3>Private local inference with hosted free fallbacks</h3>
+                    <p>Choose <strong>Free models only</strong> to keep paid providers out of the route.</p>
+                  </div>
+                  <label className="ai-mode-control model-mode-select">
+                    <span>Active route</span>
+                    <select value={aiMode} onChange={(event) => changeAiMode(event.target.value)}>
+                      {aiModes.map((modeOption) => <option key={modeOption.id} value={modeOption.id}>{modeOption.label}</option>)}
+                    </select>
+                  </label>
+                </div>
+
+                <div className="provider-grid">
+                  {(freeModels?.providers || []).map((provider) => (
+                    <section className={`provider-panel ${provider.reachable ? 'online' : 'offline'}`} key={provider.id}>
+                      <header>
+                        {provider.kind === 'local' ? <Server size={19} /> : <Cloud size={19} />}
+                        <div><strong>{provider.name}</strong><span>{provider.kind} inference</span></div>
+                        <em>{provider.reachable ? 'ready' : 'setup needed'}</em>
+                      </header>
+                      <p>{provider.note}</p>
+                      <div className="model-list">
+                        {(provider.models || []).slice(0, 8).map((model) => (
+                          <span key={model.id}><i className={model.installed ? 'ready' : ''} />{cleanModelLabel(model.id)}</span>
+                        ))}
+                      </div>
+                    </section>
+                  ))}
+                </div>
+
+                <div className="runtime-grid">
+                  <section className="runtime-panel">
+                    <h3>Fallback route</h3>
+                    <div className="route-line">
+                      {(freeModels?.routing || []).map((step, index) => (
+                        <React.Fragment key={step}><span>{index + 1}. {step}</span>{index < (freeModels?.routing || []).length - 1 && <ArrowUpRight size={14} />}</React.Fragment>
+                      ))}
+                    </div>
+                    <AiBadge meta={freeModels?.lastRuntime} label="Last response" />
+                  </section>
+                  <section className="runtime-panel">
+                    <h3>Data integrations</h3>
+                    <div className="integration-row"><span>DailyNewsUpdate</span><strong>{integrations?.dailyNewsUpdate?.connected ? 'read-only connected' : 'not found'}</strong></div>
+                    <div className="integration-row"><span>LinkedIn</span><strong>{integrations?.linkedin?.connected ? `${integrations.linkedin.items} approved posts` : 'authorization/import needed'}</strong></div>
+                    <div className="integration-row"><span>YouTube API</span><strong>{integrations?.youtube?.apiConfigured ? 'configured' : 'search fallback'}</strong></div>
+                    <div className="integration-row"><span>Source checks</span><strong>{sourceHealth ? `${sourceHealth.healthy} healthy / ${sourceHealth.failing} failing` : 'warming up'}</strong></div>
+                  </section>
+                </div>
+
+                {sourceHealth?.failing > 0 && (
+                  <section className="source-failures">
+                    <h3>Sources needing attention</h3>
+                    {sourceHealth.sources.filter((source) => !source.ok).slice(0, 10).map((source) => (
+                      <div key={`${source.kind}-${source.source}`}><span>{source.source}</span><small>{source.kind} - {source.detail || 'request failed'}</small></div>
+                    ))}
+                  </section>
+                )}
+              </div>
+            )}
+
             {portalTab === 'coach' && (
               <div className="coach-grid">
                 <div>
@@ -1006,11 +1313,11 @@ export default function App() {
               </div>
             )}
 
-            <div className="portal-pager">
+            {(portalTab === 'inbox' || portalTab === 'applications') && <div className="portal-pager">
               <button disabled={portalPage <= 1} onClick={() => fetchPortalJobs(portalPage - 1, portalQuery, portalStatus)}>Previous</button>
               <span>Page {portalPage}</span>
               <button disabled={portalJobs.length < PORTAL_LIMIT} onClick={() => fetchPortalJobs(portalPage + 1, portalQuery, portalStatus)}>Next</button>
-            </div>
+            </div>}
           </div>
         </div>
       )}
