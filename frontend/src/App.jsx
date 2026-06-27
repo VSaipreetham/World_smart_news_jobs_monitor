@@ -1220,7 +1220,7 @@ export default function App() {
                       <p>{provider.note}</p>
                       <div className="model-list">
                         {(provider.models || []).slice(0, 8).map((model) => (
-                          <span key={model.id}><i className={model.installed ? 'ready' : ''} />{cleanModelLabel(model.id)}</span>
+                          <span key={model.id}><i className={model.installed ? 'ready' : ''} />{cleanModelLabel(model.id)}{model.deployment === 'cloud' ? ' · cloud' : model.source === 'Hugging Face Hub' ? ' · HF Hub' : ''}</span>
                         ))}
                       </div>
                     </section>

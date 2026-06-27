@@ -72,11 +72,11 @@ const JOB_MAX_AGE_DAYS = Number(process.env.JOB_MAX_AGE_DAYS || 30);
 const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 14);
 const VIDEO_DB_RETENTION_HOURS = Number(process.env.VIDEO_DB_RETENTION_HOURS || 72);
 const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
-const OLLAMA_MODELS = String(process.env.OLLAMA_MODELS || 'qwen3:4b,gemma3:4b,llama3.2:3b,mistral:7b')
+const OLLAMA_MODELS = String(process.env.OLLAMA_MODELS || 'qwen3:4b,glm4:9b-chat-q2_K,hf.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF:Q4_K_M,kimi-k2.6:cloud,gemma3:4b,llama3.2:3b,mistral:7b')
     .split(',').map(model => model.trim()).filter(Boolean);
 const HUGGINGFACE_MODELS = String(process.env.HUGGINGFACE_MODELS || 'Qwen/Qwen2.5-7B-Instruct,google/gemma-2-9b-it,mistralai/Mistral-7B-Instruct-v0.3')
     .split(',').map(model => model.trim()).filter(Boolean);
-const AI_MODES = ['auto', 'free', 'ollama', 'huggingface', 'openai', 'gemini', 'openrouter', 'offline'];
+const AI_MODES = ['auto', 'free', 'ollama', 'ollama-qwen', 'ollama-glm', 'ollama-hf', 'ollama-kimi', 'huggingface', 'openai', 'gemini', 'openrouter', 'offline'];
 let aiMode = AI_MODES.includes(String(process.env.AI_MODE || '').toLowerCase())
     ? String(process.env.AI_MODE).toLowerCase()
     : 'auto';
@@ -93,7 +93,11 @@ function getAIModePayload() {
         modes: [
             { id: 'auto', label: 'Auto fallback', available: Boolean(process.env.OPENAI_API_KEY || genAI || openRouterTokens.length || huggingFaceToken || OLLAMA_BASE_URL) },
             { id: 'free', label: 'Free models only', available: Boolean(openRouterTokens.length || huggingFaceToken || OLLAMA_BASE_URL), configuredModels: [...OLLAMA_MODELS, ...HUGGINGFACE_MODELS, ...OPENROUTER_MODELS] },
-            { id: 'ollama', label: 'Ollama local', available: true, endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS },
+            { id: 'ollama', label: 'Ollama automatic', available: true, endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS },
+            { id: 'ollama-qwen', label: 'Ollama Qwen (local)', available: OLLAMA_MODELS.some(model => /qwen/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /qwen/i.test(model)) },
+            { id: 'ollama-glm', label: 'Ollama GLM (local)', available: OLLAMA_MODELS.some(model => /glm/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /glm/i.test(model)) },
+            { id: 'ollama-hf', label: 'Hugging Face model (local)', available: OLLAMA_MODELS.some(model => /hf\.co|huggingface/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /hf\.co|huggingface/i.test(model)) },
+            { id: 'ollama-kimi', label: 'Ollama Kimi (cloud)', available: OLLAMA_MODELS.some(model => /kimi/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /kimi/i.test(model)) },
             { id: 'huggingface', label: 'Hugging Face', available: Boolean(huggingFaceToken), configuredModels: HUGGINGFACE_MODELS },
             { id: 'openai', label: 'OpenAI', available: Boolean(process.env.OPENAI_API_KEY), primaryModel: OPENAI_MODEL },
             { id: 'gemini', label: 'Gemini', available: Boolean(genAI) },
@@ -563,7 +567,11 @@ async function callOllama(prompt, modelName) {
             { role: 'system', content: 'Return only valid JSON. Do not wrap it in markdown.' },
             { role: 'user', content: prompt },
         ],
-        options: { temperature: 0.25, num_predict: 1800 },
+        options: {
+            temperature: 0.25,
+            num_predict: Number(process.env.OLLAMA_NUM_PREDICT || 1200),
+            num_ctx: Number(process.env.OLLAMA_CONTEXT_SIZE || 8192),
+        },
     }, { timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 180000) });
     return parseJsonFromModel(res.data?.message?.content || res.data?.response);
 }
@@ -607,7 +615,7 @@ async function getAIInsight(prompt) {
     const allowOpenAI = aiMode === 'auto' || aiMode === 'openai';
     const allowGemini = aiMode === 'auto' || aiMode === 'gemini';
     const allowOpenRouter = aiMode === 'auto' || aiMode === 'free' || aiMode === 'openrouter';
-    const allowOllama = aiMode === 'ollama' || aiMode === 'free' || (aiMode === 'auto' && String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true');
+    const allowOllama = aiMode.startsWith('ollama') || aiMode === 'free' || (aiMode === 'auto' && String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true');
     const allowHuggingFace = aiMode === 'huggingface' || aiMode === 'free' || (aiMode === 'auto' && Boolean(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN));
     const attempts = [];
     const recordFailure = (provider, model, err) => {
@@ -625,7 +633,16 @@ async function getAIInsight(prompt) {
     };
 
     if (allowOllama) {
-        for (const modelName of OLLAMA_MODELS) {
+        const ollamaCandidates = aiMode === 'ollama-qwen'
+            ? OLLAMA_MODELS.filter(model => /qwen/i.test(model))
+            : aiMode === 'ollama-glm'
+                ? OLLAMA_MODELS.filter(model => /glm/i.test(model))
+                : aiMode === 'ollama-hf'
+                    ? OLLAMA_MODELS.filter(model => /hf\.co|huggingface/i.test(model))
+                : aiMode === 'ollama-kimi'
+                    ? OLLAMA_MODELS.filter(model => /kimi/i.test(model))
+                    : OLLAMA_MODELS;
+        for (const modelName of ollamaCandidates) {
             try {
                 return recordSuccess('Ollama', modelName, await callOllama(prompt, modelName));
             } catch (error) {
@@ -2044,13 +2061,18 @@ app.get('/api/free-models', async (req, res) => {
             {
                 id: 'ollama',
                 name: 'Ollama',
-                kind: 'local',
+                kind: OLLAMA_MODELS.some(id => id.endsWith(':cloud')) ? 'local + cloud' : 'local',
                 configured: true,
                 reachable: ollama.reachable,
                 endpoint: ollama.endpoint,
-                models: OLLAMA_MODELS.map(id => ({ id, installed: ollama.installed.includes(id) })),
+                models: OLLAMA_MODELS.map(id => ({
+                    id,
+                    installed: ollama.installed.includes(id),
+                    deployment: id.endsWith(':cloud') ? 'cloud' : 'local',
+                    source: /hf\.co|huggingface/i.test(id) ? 'Hugging Face Hub' : 'Ollama Library',
+                })),
                 installed: ollama.installed,
-                note: ollama.reachable ? 'Private local inference is ready.' : 'Start Ollama locally or configure OLLAMA_BASE_URL on a reachable host.',
+                note: ollama.reachable ? 'Local inference is ready; configured cloud models remain explicitly labeled.' : 'Start Ollama locally or configure OLLAMA_BASE_URL on a reachable host.',
             },
             {
                 id: 'openrouter',
