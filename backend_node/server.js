@@ -352,25 +352,52 @@ function inferCoordsFromText(value = '') {
     return LAND_FALLBACKS[hashString(value) % LAND_FALLBACKS.length];
 }
 
+function inferGeo(value = '') {
+    const text = String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const city = CITY_COORDS.find(([needle]) => text.includes(needle));
+    if (city) return { name: city[1], lat: city[2], lng: city[3], confidence: 'city', kind: 'city' };
+    const region = REGION_COORDS.find(([, , , pattern]) => pattern.test(text));
+    if (region) return { name: region[0], lat: region[1], lng: region[2], confidence: 'region', kind: 'country' };
+    return { ...GLOBAL_HUB };
+}
+
+function stableGeoOffset(key = '', amplitude = 0.035) {
+    return {
+        lat: ((((hashString(`${key}:lat`) % 1000) / 999) - 0.5) * amplitude),
+        lng: ((((hashString(`${key}:lng`) % 1000) / 999) - 0.5) * amplitude),
+    };
+}
+
+function normalizeGeographicLocation(value = '') {
+    const cleaned = cleanText(value);
+    const geo = inferGeo(cleaned);
+    if (geo.confidence !== 'global') return cleaned || geo.name;
+    if (/remote|worldwide|anywhere|global/i.test(cleaned)) return 'Remote / Global';
+    return 'Global';
+}
+
 async function batchGeocodeWithAI(locations) {
     const uniqueLocs = [...new Set(locations)].filter(l => l && !geoCache.has(l));
     if (uniqueLocs.length === 0) return;
-    uniqueLocs.forEach(loc => geoCache.set(loc, inferCoordsFromText(loc)));
+    uniqueLocs.forEach(loc => geoCache.set(loc, inferGeo(loc)));
 }
 
 function getPreciseCoords(loc) {
     if (geoCache.has(loc)) return geoCache.get(loc);
-    return inferCoordsFromText(loc || 'global');
+    return inferGeo(loc || 'global');
 }
 
 function toJobPoint(j, index = 0) {
     const hub = getPreciseCoords(j.location || j.location_name || j.company || j.title || 'Remote');
+    const offset = hub.confidence === 'global' ? { lat: 0, lng: 0 } : stableGeoOffset(j.url || j.title || String(index));
     const freshness = freshnessLabel(j.source_published_at || j.posted_date, j.first_seen_at || j.created_at, j.last_seen_at || j.refreshed_at);
     return {
         id: j.id ? `job-db-${j.id}` : `job-${index}-${hashString(j.url || j.title || String(index))}`,
         type: 'job',
-        lat: hub.lat + (Math.random() - 0.5) * 0.08,
-        lng: hub.lng + (Math.random() - 0.5) * 0.08,
+        lat: hub.lat + offset.lat,
+        lng: hub.lng + offset.lng,
+        geoConfidence: hub.confidence,
+        geoLabel: hub.name,
         company: j.company || j.company_or_source || 'Company',
         title: j.title || 'Open role',
         location: j.location || j.location_name || 'Remote',
@@ -390,13 +417,16 @@ function toJobPoint(j, index = 0) {
 }
 
 function toNewsPoint(n, index = 0) {
-    const hub = getPreciseCoords(n.headline || n.title || n.source || 'Global');
+    const hub = getPreciseCoords(n.location || n.headline || n.title || 'Global');
+    const offset = hub.confidence === 'global' ? { lat: 0, lng: 0 } : stableGeoOffset(n.url || n.headline || String(index), 0.05);
     const freshness = freshnessLabel(n.source_published_at || n.published_date, n.first_seen_at || n.created_at, n.last_seen_at || n.refreshed_at);
     return {
         id: n.id ? `news-db-${n.id}` : `news-${index}-${hashString(n.url || n.headline || String(index))}`,
         type: 'news',
-        lat: hub.lat + (Math.random() - 0.5) * 0.1,
-        lng: hub.lng + (Math.random() - 0.5) * 0.1,
+        lat: hub.lat + offset.lat,
+        lng: hub.lng + offset.lng,
+        geoConfidence: hub.confidence,
+        geoLabel: hub.name,
         headline: n.headline || n.title || 'News signal',
         source: n.source || n.company_or_source || 'Source',
         location: n.location || 'Global',
@@ -528,12 +558,13 @@ async function callOllama(prompt, modelName) {
         model: modelName,
         stream: false,
         format: 'json',
+        think: false,
         messages: [
             { role: 'system', content: 'Return only valid JSON. Do not wrap it in markdown.' },
             { role: 'user', content: prompt },
         ],
-        options: { temperature: 0.25 },
-    }, { timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 45000) });
+        options: { temperature: 0.25, num_predict: 1800 },
+    }, { timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 180000) });
     return parseJsonFromModel(res.data?.message?.content || res.data?.response);
 }
 
@@ -740,7 +771,7 @@ function canonicalSourceUrl(value) {
     }
 }
 
-const NON_JOB_ANCHOR_PATTERN = /(manual|handbook|flowchart|registration|login|sign in|join now|post new job|post international jobs|employer|recruiter|view jobs|jobs archives|job fairs|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|model career centers|career schemes|career information|links to govt|find domestic|find international|training by|advisories|international resources|ncs meta data|international job opportunities|privacy|terms|about us|contact us|faq|help|sitemap)/i;
+const NON_JOB_ANCHOR_PATTERN = /(salary|salaries|manual|handbook|flowchart|registration|login|sign in|join now|post new job|post international jobs|employer|recruiter|view jobs|jobs archives|job fairs|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|model career centers|career schemes|career information|links to govt|find domestic|find international|training by|advisories|international resources|ncs meta data|international job opportunities|privacy|terms|about us|contact us|faq|help|sitemap)/i;
 const GENERIC_NON_ROLE_PATTERN = /^(software development|software testing|content writing|consulting|business consulting|business analysis|debugging|agile development|project management|prototyping|mobile app development|web development|data management|international jobs|marketing|digital marketing|data entry|translation|research|training|design|graphic design|accounting|call center|electrical engineering|event management|artificial intelligence)$/i;
 const ROLE_TITLE_PATTERN = /(engineer|developer|architect|analyst|scientist|specialist|consultant|manager|designer|writer|administrator|officer|executive|associate|assistant|trainee|intern|operator|technician|accountant|recruiter|sales|support|nurse|teacher|lead|director|head|python|react|node|java|golang|devops|full[ -]?stack|front[ -]?end|back[ -]?end|software|cloud|security|machine learning|data)/i;
 
@@ -772,7 +803,7 @@ function extractJsonLdJobs(html, source) {
                 if (!node || node['@type'] !== 'JobPosting') return;
                 const company = cleanText(node.hiringOrganization?.name || node.organization?.name || source.name);
                 const locationNode = Array.isArray(node.jobLocation) ? node.jobLocation[0] : node.jobLocation;
-                const location = cleanText(locationNode?.address?.addressLocality || locationNode?.address?.addressRegion || locationNode?.address?.addressCountry || source.region || 'Remote');
+                const location = normalizeGeographicLocation(locationNode?.address?.addressLocality || locationNode?.address?.addressRegion || locationNode?.address?.addressCountry || source.region || 'Remote');
                 jobs.push({
                     title: cleanText(node.title || 'Job opening'),
                     company,
@@ -798,7 +829,7 @@ function extractAnchorJobs(html, source) {
     while ((match = anchorRegex.exec(html)) && jobs.length < 20) {
         const href = match[1];
         const text = cleanText(match[2]);
-        const detailUrl = /(\/jobs?\/view\/\d+|\/job\/[^?#]+|job[_-]?id=|jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(?:y|ies)\/[^?#]+|\/project\/\d+)/i.test(href);
+        const detailUrl = /(\/jobs?\/view\/\d+|\/job\/[^?#]+|[?&]job[_-]?id=|[?&]jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(?:y|ies)\/[^?#]+|\/project\/\d+)/i.test(href);
         const looksLikeJob = detailUrl && ROLE_TITLE_PATTERN.test(text) && !NON_JOB_ANCHOR_PATTERN.test(text);
         if (!looksLikeJob || text.length < 8 || text.length > 140 || !isLikelyPersistableJob({ title: text, source: source.name })) continue;
         const url = absoluteUrl(href, source.url);
@@ -807,7 +838,7 @@ function extractAnchorJobs(html, source) {
         jobs.push({
             title: text,
             company: source.name,
-            location: source.region || 'See posting',
+            location: normalizeGeographicLocation(source.region || 'Global'),
             url,
             isRemote: /remote/i.test(text),
             pay: 'N/A',
@@ -859,7 +890,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
             if (source.type === 'remotive' && res.data?.jobs) {
                 res.data.jobs.forEach(j => items.push({
                     title: j.title, company: j.company_name || 'Startup',
-                    location: j.candidate_required_location || 'Remote',
+                    location: normalizeGeographicLocation(j.candidate_required_location || 'Remote'),
                     url: j.url, isRemote: true, pay: j.salary || 'N/A',
                     sourcePublishedAt: toIsoOrNull(j.publication_date),
                     time: "🔴 LIVE", source: source.name
@@ -867,7 +898,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
             } else if (source.type === 'muse' && res.data?.results) {
                 res.data.results.forEach(j => items.push({
                     title: j.name, company: j.company?.name || 'Company',
-                    location: j.locations?.[0]?.name || 'Flexible',
+                    location: normalizeGeographicLocation(j.locations?.[0]?.name || 'Global'),
                     url: j.refs?.landing_page || '#', isRemote: (j.locations?.[0]?.name || '').toLowerCase().includes('remote'),
                     sourcePublishedAt: toIsoOrNull(j.publication_date),
                     pay: 'N/A', time: "⚡ POSTED", source: source.name
@@ -894,7 +925,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
             const feed = await parser.parseURL(feedUrl);
             const items = (feed.items || []).slice(0, 15).map(item => ({
                 title: cleanText(item.title || 'Role'), company: cleanText(feed.title || 'Company'),
-                location: item.categories?.[0] || 'Remote',
+                location: normalizeGeographicLocation(item.categories?.find(category => inferGeo(category).confidence !== 'global' || /remote|worldwide|anywhere/i.test(category)) || 'Global'),
                 url: item.link || '#', isRemote: true,
                 sourcePublishedAt: toIsoOrNull(item.isoDate || item.pubDate),
                 pay: 'N/A', time: "🟢 RSS LIVE", source: feed.title || feedUrl
@@ -913,6 +944,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
     // Deduplicate by URL
     const seen = new Set();
     const uniqueJobs = allRawJobs.filter(j => {
+        j.location = normalizeGeographicLocation(j.location);
         if (j.sourcePublishedAt && !isRecentDate(j.sourcePublishedAt, JOB_MAX_AGE_DAYS)) return false;
         if (!isLikelyPersistableJob(j)) return false;
         const canonicalUrl = canonicalSourceUrl(j.url);
@@ -929,10 +961,12 @@ const getScrapedJobs = async (refreshRunId = null) => {
     // Map to globe points
     uniqueJobs.forEach((j, i) => {
         const hub = getPreciseCoords(j.location);
+        const offset = hub.confidence === 'global' ? { lat: 0, lng: 0 } : stableGeoOffset(j.url || j.title || String(i));
         jobs.push({
             id: `job-${i}-${Date.now()}`,
-            type: "job", lat: hub.lat + (Math.random() - 0.5) * 0.08,
-            lng: hub.lng + (Math.random() - 0.5) * 0.08,
+            type: "job", lat: hub.lat + offset.lat,
+            lng: hub.lng + offset.lng,
+            geoConfidence: hub.confidence, geoLabel: hub.name,
             company: j.company, title: j.title, location: j.location,
             url: j.url, isRemote: j.isRemote, time: j.time,
             source: j.source,
@@ -1015,18 +1049,25 @@ const getScrapedNews = async (refreshRunId = null) => {
         seen.add(canonicalUrl);
         return true;
     });
+    uniqueNews.forEach(item => {
+        const geo = inferGeo(item.headline);
+        item.location = geo.confidence === 'global' ? 'Global' : geo.name;
+    });
 
     // Geocode headlines in chunks
     const headlines = uniqueNews.slice(0, 200).map(n => n.headline);
     await batchGeocodeWithAI(headlines);
 
     uniqueNews.forEach((n, i) => {
-        const hub = getPreciseCoords(n.headline) || getRandomHub();
+        const hub = getPreciseCoords(n.location);
+        const offset = hub.confidence === 'global' ? { lat: 0, lng: 0 } : stableGeoOffset(n.url || n.headline || String(i), 0.05);
         news.push({
             id: `news-${i}-${Date.now()}`, type: "news",
-            lat: hub.lat + (Math.random() - 0.5) * 0.1,
-            lng: hub.lng + (Math.random() - 0.5) * 0.1,
+            lat: hub.lat + offset.lat,
+            lng: hub.lng + offset.lng,
+            geoConfidence: hub.confidence, geoLabel: hub.name,
             headline: n.headline, source: n.source, url: n.url,
+            location: n.location,
             category: n.category, snippet: n.snippet, integration: n.integration || 'native',
             time: "🔴 LIVE", collectedAt: Date.now(), refreshRunId, radius: 4.5, color: "#ff3333"
         });
@@ -1114,6 +1155,58 @@ const YOUTUBE_FRESH_QUERIES = [
     "cybersecurity news today",
     "software engineering news today",
     "cloud computing news today",
+];
+
+const GLOBAL_HUB = { name: 'Global', lat: 0, lng: 0, confidence: 'global', kind: 'global' };
+const CITY_COORDS = [
+    ['san francisco', 'San Francisco', 37.7749, -122.4194], ['new york', 'New York', 40.7128, -74.0060],
+    ['toronto', 'Toronto', 43.6510, -79.3470], ['austin', 'Austin', 30.2672, -97.7431],
+    ['seattle', 'Seattle', 47.6062, -122.3321], ['mexico city', 'Mexico City', 19.4326, -99.1332],
+    ['sao paulo', 'Sao Paulo', -23.5505, -46.6333], ['buenos aires', 'Buenos Aires', -34.6037, -58.3816],
+    ['bogota', 'Bogota', 4.7110, -74.0721], ['london', 'London', 51.5074, -0.1278],
+    ['berlin', 'Berlin', 52.5200, 13.4050], ['paris', 'Paris', 48.8566, 2.3522],
+    ['amsterdam', 'Amsterdam', 52.3676, 4.9041], ['stockholm', 'Stockholm', 59.3293, 18.0686],
+    ['madrid', 'Madrid', 40.4168, -3.7038], ['lagos', 'Lagos', 6.5244, 3.3792],
+    ['nairobi', 'Nairobi', -1.2864, 36.8172], ['cape town', 'Cape Town', -33.9249, 18.4241],
+    ['cairo', 'Cairo', 30.0444, 31.2357], ['dubai', 'Dubai', 25.2048, 55.2708],
+    ['tel aviv', 'Tel Aviv', 32.0853, 34.7818], ['bengaluru', 'Bengaluru', 12.9716, 77.5946],
+    ['bangalore', 'Bengaluru', 12.9716, 77.5946], ['mumbai', 'Mumbai', 19.0760, 72.8777],
+    ['new delhi', 'Delhi', 28.6139, 77.2090], ['delhi', 'Delhi', 28.6139, 77.2090],
+    ['tokyo', 'Tokyo', 35.6895, 139.6917], ['singapore', 'Singapore', 1.3521, 103.8198],
+    ['seoul', 'Seoul', 37.5665, 126.9780], ['shanghai', 'Shanghai', 31.2304, 121.4737],
+    ['beijing', 'Beijing', 39.9042, 116.4074], ['shenzhen', 'Shenzhen', 22.5431, 114.0579],
+    ['jakarta', 'Jakarta', -6.2088, 106.8456], ['sydney', 'Sydney', -33.8688, 151.2093],
+    ['melbourne', 'Melbourne', -37.8136, 144.9631], ['auckland', 'Auckland', -36.8485, 174.7633],
+    ['riyadh', 'Riyadh', 24.7136, 46.6753], ['zurich', 'Zurich', 47.3769, 8.5417],
+    ['dublin', 'Dublin', 53.3498, -6.2603], ['warsaw', 'Warsaw', 52.2297, 21.0122],
+    ['lisbon', 'Lisbon', 38.7223, -9.1393], ['helsinki', 'Helsinki', 60.1699, 24.9384],
+    ['hyderabad', 'Hyderabad', 17.3850, 78.4867], ['chennai', 'Chennai', 13.0827, 80.2707],
+    ['pune', 'Pune', 18.5204, 73.8567], ['kolkata', 'Kolkata', 22.5726, 88.3639],
+    ['gurugram', 'Gurugram', 28.4595, 77.0266], ['gurgaon', 'Gurugram', 28.4595, 77.0266],
+    ['noida', 'Noida', 28.5355, 77.3910], ['ahmedabad', 'Ahmedabad', 23.0225, 72.5714],
+    ['jaipur', 'Jaipur', 26.9124, 75.7873], ['kochi', 'Kochi', 9.9312, 76.2673],
+    ['atlanta', 'Atlanta', 33.7490, -84.3880], ['boston', 'Boston', 42.3601, -71.0589],
+    ['chicago', 'Chicago', 41.8781, -87.6298], ['dallas', 'Dallas', 32.7767, -96.7970],
+    ['los angeles', 'Los Angeles', 34.0522, -118.2437], ['miami', 'Miami', 25.7617, -80.1918],
+    ['denver', 'Denver', 39.7392, -104.9903], ['washington dc', 'Washington DC', 38.9072, -77.0369],
+    ['munich', 'Munich', 48.1351, 11.5820], ['frankfurt', 'Frankfurt', 50.1109, 8.6821],
+    ['barcelona', 'Barcelona', 41.3874, 2.1686], ['milan', 'Milan', 45.4642, 9.1900],
+    ['rome', 'Rome', 41.9028, 12.4964], ['brussels', 'Brussels', 50.8503, 4.3517],
+    ['prague', 'Prague', 50.0755, 14.4378], ['vienna', 'Vienna', 48.2082, 16.3738],
+    ['copenhagen', 'Copenhagen', 55.6761, 12.5683], ['oslo', 'Oslo', 59.9139, 10.7522],
+    ['hong kong', 'Hong Kong', 22.3193, 114.1694], ['manila', 'Manila', 14.5995, 120.9842],
+    ['bangkok', 'Bangkok', 13.7563, 100.5018], ['kuala lumpur', 'Kuala Lumpur', 3.1390, 101.6869],
+];
+const REGION_COORDS = [
+    ['India', 20.5937, 78.9629, /\b(india|indian)\b/i], ['United States', 39.8283, -98.5795, /\b(united states|usa|u\.s\.|us only)\b/i],
+    ['United Kingdom', 55.3781, -3.4360, /\b(united kingdom|uk|britain|england|scotland|wales)\b/i],
+    ['Canada', 56.1304, -106.3468, /\bcanada\b/i], ['Australia', -25.2744, 133.7751, /\baustralia\b/i],
+    ['Germany', 51.1657, 10.4515, /\bgermany\b/i], ['France', 46.2276, 2.2137, /\bfrance\b/i],
+    ['Brazil', -14.2350, -51.9253, /\bbrazil\b/i], ['Mexico', 23.6345, -102.5528, /\bmexico\b/i],
+    ['South Africa', -30.5595, 22.9375, /\bsouth africa\b/i], ['United Arab Emirates', 23.4241, 53.8478, /\b(united arab emirates|uae)\b/i],
+    ['Japan', 36.2048, 138.2529, /\bjapan\b/i], ['China', 35.8617, 104.1954, /\bchina\b/i],
+    ['South Korea', 35.9078, 127.7669, /\b(south korea|korea)\b/i], ['New Zealand', -40.9006, 174.8860, /\bnew zealand\b/i],
+    ['Saudi Arabia', 23.8859, 45.0792, /\bsaudi arabia\b/i],
 ];
 
 const YOUTUBE_BASE_QUERIES = [
@@ -1317,9 +1410,9 @@ async function cleanupKnownJobNoise() {
             DELETE FROM jobs
             WHERE source = ANY($1::text[])
               AND (
-                LOWER(COALESCE(title, '')) ~ '(join now|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|privacy|terms|about us|contact us|sign in|login)'
+                LOWER(COALESCE(title, '')) ~ '(salary|salaries|join now|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|privacy|terms|about us|contact us|sign in|login)'
                 OR LOWER(COALESCE(title, '')) !~ '(engineer|developer|architect|analyst|scientist|specialist|consultant|manager|designer|writer|administrator|officer|executive|associate|assistant|trainee|intern|operator|technician|accountant|recruiter|sales|support|nurse|teacher|lead|director|head|python|react|node|java|golang|devops|full.?stack|front.?end|back.?end|software|cloud|security|machine learning|data)'
-                OR LOWER(COALESCE(url, '')) !~ '(\/jobs?\/view\/([0-9]+)|\/job\/|job[_-]?id=|jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(y|ies)\/|\/project\/[0-9]+)'
+                OR LOWER(COALESCE(url, '')) !~ '(\/jobs?\/view\/([0-9]+)|\/job\/|[?&]job[_-]?id=|[?&]jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(y|ies)\/|\/project\/[0-9]+)'
               );
         `, [JOB_BOARD_SOURCES.map(source => source.name)]);
         await pool.query(`
@@ -1528,6 +1621,48 @@ function extractResumeProfile(resumeText = '') {
     };
 }
 
+function extractResumeEvidence(resumeText = '') {
+    const lines = String(resumeText || '')
+        .split(/\r?\n/)
+        .map(line => cleanText(line.replace(/^[\s*\-\u2022]+/, '')))
+        .filter(line => line.length >= 24 && line.length <= 280);
+    const quantified = lines.filter(line => /\b\d+(?:\.\d+)?\s*(%|x|k|m|million|billion|users|clients|hours|days|months|years)?\b/i.test(line));
+    const actionLed = lines.filter(line => /^(built|created|designed|developed|delivered|implemented|improved|increased|reduced|led|launched|migrated|optimized|owned|scaled|automated|managed|architected)/i.test(line));
+    const sectionSignals = ['experience', 'skills', 'education', 'projects', 'summary'].filter(section => new RegExp(`\\b${section}\\b`, 'i').test(resumeText));
+    const score = Math.min(100,
+        25
+        + Math.min(25, quantified.length * 5)
+        + Math.min(20, actionLed.length * 4)
+        + Math.min(20, sectionSignals.length * 4)
+        + (String(resumeText).length >= 1800 && String(resumeText).length <= 9000 ? 10 : 4)
+    );
+    return {
+        score,
+        quantifiedBullets: quantified.slice(0, 6),
+        actionBullets: actionLed.slice(0, 6),
+        strongestProof: [...new Set([...quantified, ...actionLed])].slice(0, 8),
+        sectionSignals,
+        lineCount: lines.length,
+    };
+}
+
+function explainJobMatch(job = {}, profile = {}) {
+    const jobText = `${job.title || ''} ${job.source || ''} ${job.location || ''}`.toLowerCase();
+    const matchedSkills = (profile.skills || []).filter(skill => jobText.includes(skill));
+    const roleFamily = classifyRoleFamily(job.title || '');
+    const reasons = [];
+    if ((profile.roleSignals || []).includes(roleFamily)) reasons.push(`${roleFamily} role alignment`);
+    if (matchedSkills.length) reasons.push(`skill overlap: ${matchedSkills.slice(0, 5).join(', ')}`);
+    if (classifySeniority(job.title || '') === profile.seniority) reasons.push(`${profile.seniority} seniority alignment`);
+    if (/remote|hybrid/i.test(job.location || '')) reasons.push(`${classifyWorkMode(job.location)} work mode`);
+    return {
+        reasons: reasons.length ? reasons : ['title and market-keyword similarity'],
+        matchedSkills,
+        roleFamily,
+        confidence: matchedSkills.length >= 3 ? 'high' : reasons.length >= 2 ? 'medium' : 'exploratory',
+    };
+}
+
 function scoreJobForRag(job = {}, profile = {}, query = '') {
     const jobText = `${job.title || ''} ${job.company || ''} ${job.location || ''} ${job.source || ''} ${job.pay || ''}`.toLowerCase();
     const queryTokens = new Set(tokenizeText(query));
@@ -1566,17 +1701,19 @@ async function retrieveJobsForRag({ resumeText = '', question = '', limit = 24, 
                 ${SQL_CLEAN('location')} AS location, pay, posted_date, status, notes, match_score, created_at
              FROM jobs
              WHERE LOWER(COALESCE(status, 'open')) NOT IN ('archived', 'rejected')
-         ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC
+         ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC
          LIMIT $1`,
         [sampleLimit]
     );
     const scored = jobsRes.rows
         .map(job => ({
             ...job,
-            match_score: Math.max(scoreJobAgainstResume(resumeText, job), scoreJobForRag(job, profile, question)),
+            match_score: Math.min(99, Math.max(scoreJobAgainstResume(resumeText, job), scoreJobForRag(job, profile, question))),
             role_family: classifyRoleFamily(job.title),
             seniority: classifySeniority(job.title),
             work_mode: classifyWorkMode(job.location),
+            application_url: /^https?:\/\//i.test(job.url || '') ? job.url : null,
+            match_explanation: explainJobMatch(job, profile),
         }))
         .sort((a, b) => b.match_score - a.match_score);
     return {
@@ -1589,26 +1726,45 @@ async function retrieveJobsForRag({ resumeText = '', question = '', limit = 24, 
 
 function buildAgenticResumeReport(resumeText = '', retrieved = {}) {
     const profile = retrieved.profile || extractResumeProfile(resumeText);
+    const resumeEvidence = extractResumeEvidence(resumeText);
     const jobs = retrieved.jobs || [];
     const topSkills = profile.skills.slice(0, 12);
     const marketSkills = [...new Set(jobs.flatMap(job => TECH_KEYWORDS.filter(skill => `${job.title} ${job.source}`.toLowerCase().includes(skill))))];
     const missingSkills = marketSkills.filter(skill => !profile.skills.includes(skill)).slice(0, 10);
     const companies = [...new Set(jobs.map(job => job.company).filter(Boolean))].slice(0, 10);
     const targetRoles = [...new Set(jobs.map(job => job.role_family).filter(Boolean))].slice(0, 6);
+    const topMatches = jobs.slice(0, 8).map(job => ({
+        id: job.id,
+        title: job.title,
+        company: job.company,
+        location: job.location || 'Global',
+        score: job.match_score,
+        confidence: job.match_explanation?.confidence || 'exploratory',
+        reasons: job.match_explanation?.reasons || [],
+        applyUrl: job.application_url || job.url || null,
+    }));
     return {
-        summary: `Profile reads as ${profile.seniority} level with focus on ${profile.roleSignals.join(', ')}. Retrieved ${jobs.length} strong job matches from ${retrieved.sampleSize || jobs.length} live roles.`,
+        summary: `Your resume currently signals ${profile.seniority}-level ${profile.roleSignals.join(' / ')} work. It scored ${resumeEvidence.score}/100 for evidence strength and was compared with ${retrieved.sampleSize || jobs.length} live roles; ${jobs.length} were retained for focused review.`,
         profile,
+        resumeEvidence,
         topSkills,
         missingSkills,
         targetRoles,
         companies,
+        topMatches,
+        positioning: {
+            headline: `${profile.seniority === 'early' ? 'Emerging' : profile.seniority === 'lead' ? 'Lead' : profile.seniority[0].toUpperCase() + profile.seniority.slice(1)} ${targetRoles.slice(0, 2).join(' / ') || 'Software'} professional | ${(topSkills.length ? topSkills : profile.keywords).slice(0, 5).join(' | ')}`,
+            advantage: resumeEvidence.strongestProof[0] || `Breadth across ${(topSkills.length ? topSkills : profile.keywords).slice(0, 5).join(', ') || 'software delivery'}`,
+            constraint: missingSkills.length ? `Market evidence repeatedly asks for ${missingSkills.slice(0, 4).join(', ')}` : 'The current job metadata does not expose a decisive technical gap; validate against each full description before applying.',
+        },
         actions: [
-            `Tune resume headline toward: ${targetRoles.slice(0, 3).join(', ') || 'software engineering'}.`,
-            `Add measurable bullets for: ${(topSkills.length ? topSkills : profile.keywords.slice(0, 5)).join(', ') || 'core project impact'}.`,
-            `Build or highlight proof for missing market skills: ${missingSkills.slice(0, 5).join(', ') || 'no obvious critical gaps'}.`,
-            `Apply first to: ${companies.slice(0, 5).join(', ') || 'the highest match companies shown below'}.`,
+            `Today: replace the resume headline with a role-specific version aimed at ${targetRoles.slice(0, 3).join(', ') || 'software engineering'}.`,
+            `Within 48 hours: strengthen ${Math.max(3, 6 - resumeEvidence.quantifiedBullets.length)} bullets with scope, action, metric, and business outcome.`,
+            `This week: create or surface proof for ${missingSkills.slice(0, 5).join(', ') || 'the top requirements in each full job description'}.`,
+            `Apply in this order: ${companies.slice(0, 5).join(', ') || 'the highest-confidence matches below'}, tailoring the first third of the resume each time.`,
         ],
-        evidence: jobs.slice(0, 8).map(job => `${job.match_score}% ${job.title} @ ${job.company} (${job.location || 'Remote'})`),
+        evidence: topMatches.map(job => `${job.score}% ${job.title} @ ${job.company} (${job.location}) - ${job.reasons.join('; ')}`),
+        caveat: 'Match scores use resume text plus listing metadata available in this portal. Open the full posting before applying because some boards do not expose complete descriptions.',
     };
 }
 
@@ -1617,6 +1773,10 @@ function formatAgenticReport(report = {}, jobs = []) {
         `Agentic RAG Resume Report`,
         ``,
         `Summary: ${report.summary || 'Resume analyzed against the live jobs database.'}`,
+        `Resume evidence score: ${report.resumeEvidence?.score ?? 'N/A'}/100`,
+        `Suggested headline: ${report.positioning?.headline || 'Not enough evidence'}`,
+        `Differentiator: ${report.positioning?.advantage || 'Add a quantified accomplishment'}`,
+        `Primary constraint: ${report.positioning?.constraint || 'Validate full job descriptions'}`,
         ``,
         `Target roles: ${(report.targetRoles || []).join(', ') || 'Not enough signal yet'}`,
         `Matched skills: ${(report.topSkills || []).join(', ') || 'No strong explicit skill signals found'}`,
@@ -1625,8 +1785,13 @@ function formatAgenticReport(report = {}, jobs = []) {
         `Recommended actions:`,
         ...(report.actions || []).map(item => `- ${item}`),
         ``,
-        `Evidence from retrieved jobs:`,
-        ...(report.evidence || jobs.slice(0, 8).map(job => `${job.match_score}% ${job.title} @ ${job.company}`)).map(item => `- ${item}`),
+        `Best live opportunities:`,
+        ...((report.topMatches || []).map(job => `- ${job.score}% [${job.title} @ ${job.company}](${job.applyUrl || '#'}) - ${job.confidence} confidence; ${job.reasons.join('; ')}`)),
+        ``,
+        `Resume proof already detected:`,
+        ...((report.resumeEvidence?.strongestProof || []).slice(0, 5).map(item => `- ${item}`)),
+        ``,
+        `Important: ${report.caveat || 'Review each full job description before applying.'}`,
     ].join('\n');
 }
 
@@ -1731,8 +1896,12 @@ async function refreshAllData() {
         if (!cache.dashboardData && pool) {
             console.log("💾 Loading initial data from Database...");
             const [dbJobs, dbNews, dbVids] = await Promise.all([
-                pool.query('SELECT * FROM jobs ORDER BY COALESCE(refreshed_at, created_at) DESC LIMIT 500'),
-                pool.query('SELECT * FROM news ORDER BY COALESCE(refreshed_at, created_at) DESC LIMIT 500'),
+                pool.query(`SELECT * FROM jobs
+                    WHERE COALESCE(source_published_at, first_seen_at, created_at) >= NOW() - $1::interval
+                    ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC LIMIT 500`, [`${JOB_MAX_AGE_DAYS} days`]),
+                pool.query(`SELECT * FROM news
+                    WHERE COALESCE(source_published_at, first_seen_at, created_at) >= NOW() - $1::interval
+                    ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC LIMIT 500`, [`${NEWS_MAX_AGE_DAYS} days`]),
                 pool.query('SELECT * FROM youtube_videos WHERE published_at >= NOW() - $1::interval ORDER BY published_at DESC, id DESC LIMIT 60', [`${VIDEO_MAX_AGE_DAYS} days`])
             ]);
 
@@ -2169,9 +2338,9 @@ app.get('/api/portal-jobs', async (req, res) => {
         const total = parseInt(countRes.rows[0].count);
 
         const jobsRes = await pool.query(
-            `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, url, source, ${SQL_CLEAN('location')} AS location, pay, posted_date, status, notes, match_score, applied_at, follow_up_at, archived_at, refreshed_at, refresh_run_id
+            `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, url, source, ${SQL_CLEAN('location')} AS location, pay, posted_date, source_published_at, first_seen_at, last_seen_at, status, notes, match_score, applied_at, follow_up_at, archived_at, refreshed_at, refresh_run_id
              FROM jobs ${whereClause}
-             ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC
+             ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC
              LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
             [...params, parseInt(limit), offset]
         );
@@ -2238,8 +2407,8 @@ app.get('/api/portal-analytics', async (req, res) => {
     if (!pool) return res.json({ totals: {}, topCompanies: [], topSources: [], topLocations: [], keywords: [], funnel: [] });
     try {
         const jobsRes = await pool.query(
-            `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, source, ${SQL_CLEAN('location')} AS location, pay, status, posted_date, created_at, refreshed_at, applied_at
-             FROM jobs ORDER BY COALESCE(refreshed_at, created_at) DESC, id DESC LIMIT 2500`
+            `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, source, ${SQL_CLEAN('location')} AS location, pay, status, posted_date, source_published_at, first_seen_at, last_seen_at, created_at, refreshed_at, applied_at
+             FROM jobs ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC LIMIT 2500`
         );
         const rows = jobsRes.rows;
         const countBy = (fn, limit = 12) => {
@@ -2261,7 +2430,7 @@ app.get('/api/portal-analytics', async (req, res) => {
         const statusCounts = countBy(row => normalizeJobStatus(row.status));
         const now = Date.now();
         const ageBucket = (row) => {
-            const created = row.refreshed_at ? new Date(row.refreshed_at).getTime() : (row.created_at ? new Date(row.created_at).getTime() : now);
+            const created = row.source_published_at ? new Date(row.source_published_at).getTime() : (row.first_seen_at ? new Date(row.first_seen_at).getTime() : (row.created_at ? new Date(row.created_at).getTime() : now));
             const hours = (now - created) / (60 * 60 * 1000);
             if (hours <= 6) return 'last 6h';
             if (hours <= 24) return 'last 24h';
@@ -2318,14 +2487,14 @@ app.post('/api/portal-rank-resume', async (req, res) => {
     try {
         const retrieved = await retrieveJobsForRag({ resumeText, question: req.body.goal || '', limit, sampleLimit: 1800 });
         const ranked = retrieved.jobs;
-        for (const job of ranked.slice(0, 50)) {
-            await pool.query('UPDATE jobs SET match_score = $1 WHERE id = $2', [job.match_score, job.id]);
-        }
         const report = buildAgenticResumeReport(resumeText, retrieved);
         res.json({
             matches: ranked,
             report,
             reportMarkdown: formatAgenticReport(report, ranked),
+            provider: 'Agentic RAG',
+            model: 'deterministic-evidence-ranker-v2',
+            fallback: false,
             retrieval: {
                 sampleSize: retrieved.sampleSize,
                 analytics: retrieved.analytics,
@@ -2347,14 +2516,15 @@ app.post('/api/portal-agentic-rag', async (req, res) => {
         const deterministic = question.trim()
             ? `${formatAgenticReport(report, retrieved.jobs)}\n\n${formatMarketAnswer(question, retrieved)}`
             : formatAgenticReport(report, retrieved.jobs);
-        const prompt = `You are an Agentic RAG career coach. Use only the retrieved evidence. Improve the answer but do not invent companies or jobs.
+        const prompt = `You are a direct, evidence-led Agentic RAG career strategist. Use only the resume and retrieved jobs. Do not invent experience, metrics, requirements, companies, or jobs.
 Question: ${question}
 Resume profile: ${JSON.stringify(report.profile)}
+Resume evidence: ${JSON.stringify(report.resumeEvidence)}
 Retrieved jobs:
-${retrieved.jobs.slice(0, 16).map(job => `- ${job.match_score}% ${job.title} @ ${job.company} (${job.location}) [${job.source}]`).join('\n')}
+${retrieved.jobs.slice(0, 16).map(job => `- ${job.match_score}% ${job.title} @ ${job.company} (${job.location}) [${job.source}] Apply: ${job.application_url || job.url || 'unavailable'} Reasons: ${(job.match_explanation?.reasons || []).join('; ')}`).join('\n')}
 Deterministic draft:
 ${deterministic}
-Return JSON: {"answer":"markdown answer","actions":["action"],"risks":["risk"]}`;
+Write an engaging but practical markdown answer with these sections: Career thesis, What your resume proves, Best opportunities with apply links and match reasons, Resume changes using exact evidence from the resume, 7-day action sprint, Risks and uncertainty. Be specific enough that the user can act immediately. Return JSON: {"answer":"markdown answer","actions":["specific action"],"risks":["evidence limitation"]}`;
         const ai = coerceModelObject(await getAIInsight(prompt));
         res.json({
             answer: cleanModelText(ai?.answer) || deterministic,
@@ -2363,8 +2533,8 @@ Return JSON: {"answer":"markdown answer","actions":["action"],"risks":["risk"]}`
             matches: retrieved.jobs,
             report,
             retrieval: { sampleSize: retrieved.sampleSize, analytics: retrieved.analytics },
-            provider: aiRuntime.lastProvider,
-            model: aiRuntime.lastModel,
+            provider: ai?.answer ? aiRuntime.lastProvider : 'Deterministic RAG',
+            model: ai?.answer ? aiRuntime.lastModel : 'evidence-coach-v2',
             fallback: !ai?.answer,
         });
     } catch (e) {
@@ -2403,8 +2573,8 @@ Return JSON: {"result":"markdown content"}`;
         const ai = coerceModelObject(await getAIInsight(prompt));
         res.json({
             result: cleanModelText(ai?.result || ai?.answer) || fallbackToolkitAgentic(type, job, resumeText, retrieved),
-            provider: aiRuntime.lastProvider,
-            model: aiRuntime.lastModel,
+            provider: (ai?.result || ai?.answer) ? aiRuntime.lastProvider : 'Deterministic RAG',
+            model: (ai?.result || ai?.answer) ? aiRuntime.lastModel : 'evidence-toolkit-v2',
             fallback: !ai?.result,
             retrieval: { sampleSize: retrieved.sampleSize, evidence: retrieved.jobs.slice(0, 8), report },
         });
@@ -2450,7 +2620,7 @@ app.get('/api/portal-export.csv', async (req, res) => {
     try {
         const jobsRes = await pool.query(
             `SELECT id, title, company, location, pay, source, status, match_score, posted_date, applied_at, follow_up_at, notes, url
-             FROM jobs ORDER BY id DESC LIMIT 5000`
+             FROM jobs ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC LIMIT 5000`
         );
         const headers = ['id', 'title', 'company', 'location', 'pay', 'source', 'status', 'match_score', 'posted_date', 'applied_at', 'follow_up_at', 'notes', 'url'];
         const escapeCsv = value => `"${String(value ?? '').replace(/"/g, '""')}"`;

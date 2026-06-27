@@ -1594,6 +1594,40 @@ main {
   cursor: pointer;
 }
 
+.portal-job-shell,
+.ranked-job-row {
+  position: relative;
+  min-width: 0;
+}
+
+.portal-job-shell .portal-job,
+.ranked-job-row .portal-job {
+  padding-right: 82px;
+}
+
+.quick-apply {
+  position: absolute;
+  top: 10px;
+  right: 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  border: 1px solid #a6f4c5;
+  border-radius: 6px;
+  padding: 0 8px;
+  background: #ecfdf3;
+  color: #067647;
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.quick-apply:hover {
+  border-color: #12b76a;
+  background: #d1fadf;
+}
+
 .portal-job.active {
   border-color: #1457d9;
   background: #eef4ff;

@@ -279,11 +279,12 @@ export default function App() {
           if (portalOpen) {
             fetchPortalJobs(1, portalQuery, portalStatus);
             fetchPortalAnalytics();
+            fetchOperationalConfig();
           }
         }, 15000);
       }
       if (portalOpen) {
-        await Promise.all([fetchPortalJobs(1, portalQuery, portalStatus), fetchPortalAnalytics()]);
+        await Promise.all([fetchPortalJobs(1, portalQuery, portalStatus), fetchPortalAnalytics(), fetchOperationalConfig()]);
       }
     } finally {
       setIsRefreshing(false);
@@ -505,17 +506,17 @@ export default function App() {
 
   const filteredFeed = useMemo(() => scopedSignals.slice(0, FEED_LIMIT), [scopedSignals]);
 
-  const globeJobs = useMemo(() => scopedJobs.slice(0, FEED_LIMIT), [scopedJobs]);
-  const globeNews = useMemo(() => scopedNews.slice(0, FEED_LIMIT), [scopedNews]);
+  const globeJobs = useMemo(() => scopedJobs.filter((item) => item.geoConfidence !== 'global').slice(0, FEED_LIMIT), [scopedJobs]);
+  const globeNews = useMemo(() => scopedNews.filter((item) => item.geoConfidence !== 'global').slice(0, FEED_LIMIT), [scopedNews]);
   const globeSignals = useMemo(() => {
     if (globeMode === 'jobs') return globeJobs;
     if (globeMode === 'news') return globeNews;
-    return scopedSignals;
-  }, [globeJobs, globeMode, globeNews, scopedSignals]);
+    return [...globeJobs, ...globeNews];
+  }, [globeJobs, globeMode, globeNews]);
   const globeClusters = useMemo(() => {
     const map = new Map();
     globeSignals.forEach((item) => {
-      const label = item.location || (item.type === 'job' ? 'Remote' : 'Global');
+      const label = item.geoLabel || item.location || 'Global';
       const key = label.toLowerCase();
       const current = map.get(key) || { label, lat: 0, lng: 0, count: 0, jobs: 0, news: 0, sources: new Set(), fresh: 0 };
       current.lat += Number(item.lat || 0);
@@ -1011,7 +1012,7 @@ export default function App() {
             </div>
             {selectedPoint.url && selectedPoint.url !== '#' && (
               <a className="primary-button full" href={selectedPoint.url} target="_blank" rel="noreferrer">
-                Open source <ExternalLink size={15} />
+                {selectedPoint.type === 'job' ? 'Apply on source' : 'Read full story'} <ExternalLink size={15} />
               </a>
             )}
           </div>
@@ -1093,11 +1094,14 @@ export default function App() {
                   {portalJobs
                     .filter((job) => portalTab === 'inbox' ? !['applied', 'interview', 'offer'].includes(job.status) : ['applied', 'interview', 'offer', 'rejected'].includes(job.status))
                     .map((job) => (
-                      <button className={`portal-job ${selectedPortalJob?.id === job.id ? 'active' : ''}`} onClick={() => setSelectedPortalJob(job)} key={job.id || job.url}>
-                        <strong>{job.title}</strong>
-                        <span>{job.company} - {job.location || 'Remote'}</span>
-                        <small>{job.status || 'open'} {job.match_score ? `- ${job.match_score}% match` : ''} - refreshed {formatDateAge(job.refreshed_at)}</small>
-                      </button>
+                      <div className="portal-job-shell" key={job.id || job.url}>
+                        <button className={`portal-job ${selectedPortalJob?.id === job.id ? 'active' : ''}`} onClick={() => setSelectedPortalJob(job)}>
+                          <strong>{job.title}</strong>
+                          <span>{job.company} - {job.location || 'Remote'}</span>
+                          <small>{job.status || 'open'} {job.match_score ? `- ${job.match_score}% match` : ''} - refreshed {formatDateAge(job.refreshed_at)}</small>
+                        </button>
+                        {job.url && <a className="quick-apply" href={job.url} target="_blank" rel="noreferrer" title="Apply on source"><ExternalLink size={14} /> Apply</a>}
+                      </div>
                     ))}
                   {portalJobs.length === 0 && <EmptyState title="No jobs found for this filter." />}
                 </div>
@@ -1111,7 +1115,7 @@ export default function App() {
                         {['applied', 'interview', 'offer', 'rejected', 'archived'].map((status) => (
                           <button key={status} onClick={() => updatePortalJob(selectedPortalJob, { status })}>{status}</button>
                         ))}
-                        <a href={selectedPortalJob.url || '#'} target="_blank" rel="noreferrer">Open <ExternalLink size={13} /></a>
+                        <a href={selectedPortalJob.url || '#'} target="_blank" rel="noreferrer">Apply on source <ExternalLink size={13} /></a>
                       </div>
                       <textarea
                         className="notes-box"
@@ -1284,10 +1288,14 @@ export default function App() {
                     </>
                   )}
                   {rankedJobs.map((job) => (
-                    <button className="portal-job" key={job.id} onClick={() => { setSelectedPortalJob(job); setPortalTab('applications'); }}>
-                      <strong>{job.match_score}% - {job.title}</strong>
-                      <span>{job.company} - {job.location || 'Remote'}</span>
-                    </button>
+                    <div className="ranked-job-row" key={job.id}>
+                      <button className="portal-job" onClick={() => { setSelectedPortalJob(job); setPortalTab('applications'); }}>
+                        <strong>{job.match_score}% - {job.title}</strong>
+                        <span>{job.company} - {job.location || 'Remote'}</span>
+                        <small>{job.match_explanation?.confidence || 'exploratory'} confidence - {(job.match_explanation?.reasons || []).join(' - ')}</small>
+                      </button>
+                      {(job.application_url || job.url) && <a className="quick-apply" href={job.application_url || job.url} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Apply</a>}
+                    </div>
                   ))}
                   {rankedJobs.length === 0 && <EmptyState title="Paste your resume and rank jobs to see best matches." />}
                 </div>
