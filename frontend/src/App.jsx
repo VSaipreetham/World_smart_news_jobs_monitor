@@ -86,10 +86,10 @@ function normalizeVideos(videos = []) {
     .filter((video) => video.videoId);
 }
 
-function Metric({ icon: Icon, label, value, tone = 'default' }) {
+function Metric({ icon, label, value, tone = 'default' }) {
   return (
     <div className={`metric ${tone}`}>
-      <Icon size={17} />
+      {React.createElement(icon, { size: 17 })}
       <div>
         <span>{label}</span>
         <strong>{value}</strong>
@@ -125,6 +125,22 @@ function cleanModelLabel(value) {
     .replace(/^qwen\//, '')
     .replace(/^nvidia\//, '')
     .replace(/^cohere\//, '');
+}
+
+function modelStatusLabel(status) {
+  const labels = {
+    ready: 'Working',
+    installed: 'Ready to test',
+    configured: 'Configured',
+    not_tested: 'Not tested',
+    not_installed: 'Not installed',
+    not_configured: 'Setup required',
+    authorization_required: 'Sign in required',
+    subscription_required: 'Plan required',
+    rate_limited: 'Cooling down',
+    not_available: 'Unavailable',
+  };
+  return labels[status] || 'Needs attention';
 }
 
 function AiBadge({ meta, label = 'AI' }) {
@@ -178,6 +194,9 @@ export default function App() {
   const [freeModels, setFreeModels] = useState(null);
   const [integrations, setIntegrations] = useState(null);
   const [sourceHealth, setSourceHealth] = useState(null);
+  const [selectedJobSources, setSelectedJobSources] = useState([]);
+  const [sourceScrapeResult, setSourceScrapeResult] = useState(null);
+  const [modelProbeResult, setModelProbeResult] = useState(null);
   const [resumeFileName, setResumeFileName] = useState('');
   const [aiAttribution, setAiAttribution] = useState({});
   const [globeMode, setGlobeMode] = useState('opportunity');
@@ -196,7 +215,9 @@ export default function App() {
       setAiModes(json.modes || []);
     }
     if (sourcesRes.status === 'fulfilled' && sourcesRes.value.ok) {
-      setSourceRegistry(await sourcesRes.value.json());
+      const json = await sourcesRes.value.json();
+      setSourceRegistry(json);
+      setSelectedJobSources((current) => current.length ? current : (json.featuredProviderIds || []).slice(0, 6));
     }
     if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) setFreeModels(await modelsRes.value.json());
     if (integrationsRes.status === 'fulfilled' && integrationsRes.value.ok) setIntegrations(await integrationsRes.value.json());
@@ -322,6 +343,46 @@ export default function App() {
       setAiMode(json.active || modeId);
       setAiModes(json.modes || aiModes);
       setHealth((current) => current ? { ...current, ai: { ...(current.ai || {}), mode: json.active || modeId } } : current);
+    }
+  };
+
+  const runModelHealthCheck = async () => {
+    setPortalBusy(true);
+    setBusyLabel('Testing AI response routes');
+    try {
+      const res = await apiFetch('/api/model-health-check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const json = await res.json();
+      setModelProbeResult(json);
+      await fetchOperationalConfig();
+    } finally {
+      setPortalBusy(false);
+      setBusyLabel('');
+    }
+  };
+
+  const scrapeSelectedSources = async () => {
+    if (!selectedJobSources.length) return;
+    setPortalBusy(true);
+    setBusyLabel('Fetching selected job sources');
+    setSourceScrapeResult(null);
+    try {
+      const res = await apiFetch('/api/portal-scrape-sources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceIds: selectedJobSources }),
+      });
+      const json = await res.json();
+      setSourceScrapeResult(json);
+      if (res.ok) {
+        await Promise.all([fetchDashboard(), fetchPortalJobs(1, '', portalStatus), fetchPortalAnalytics(), fetchOperationalConfig()]);
+      }
+    } finally {
+      setPortalBusy(false);
+      setBusyLabel('');
     }
   };
 
@@ -1060,9 +1121,10 @@ export default function App() {
                 ['inbox', 'Inbox'],
                 ['applications', 'Applications'],
                 ['analytics', 'Analytics'],
+                ['sources', 'Job Sources'],
                 ['coach', 'Resume AI'],
                 ['market', 'Market Q&A'],
-                ['models', 'Free Models'],
+                ['models', 'AI Engines'],
               ].map(([id, label]) => (
                 <button key={id} className={portalTab === id ? 'active' : ''} onClick={() => setPortalTab(id)}>{label}</button>
               ))}
@@ -1193,34 +1255,96 @@ export default function App() {
               </div>
             )}
 
+            {portalTab === 'sources' && (
+              <div className="source-studio">
+                <div className="source-studio-head">
+                  <div>
+                    <span className="section-kicker"><Filter size={15} /> Targeted job fetch</span>
+                    <h3>Choose where the next jobs come from</h3>
+                    <p>{selectedJobSources.length} of 12 provider slots selected</p>
+                  </div>
+                  <div className="source-studio-actions">
+                    <button onClick={() => setSelectedJobSources((sourceRegistry?.featuredProviderIds || []).slice(0, 12))}>Featured</button>
+                    <button onClick={() => setSelectedJobSources([])}>Clear</button>
+                    <button className="primary-button" onClick={scrapeSelectedSources} disabled={!selectedJobSources.length || portalBusy}>
+                      <RefreshCcw size={15} /> Fetch selected
+                    </button>
+                  </div>
+                </div>
+                <div className="source-provider-grid">
+                  {(sourceRegistry?.providers || []).map((provider) => {
+                    const checked = selectedJobSources.includes(provider.id);
+                    return (
+                      <label className={`source-provider ${checked ? 'selected' : ''}`} key={provider.id}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) => setSelectedJobSources((current) => event.target.checked
+                            ? (current.length < 12 ? [...current, provider.id] : current)
+                            : current.filter((id) => id !== provider.id))}
+                        />
+                        <span><strong>{provider.label}</strong><small>{provider.kinds.join(' + ')} - {provider.sourceCount} endpoint{provider.sourceCount === 1 ? '' : 's'} - {provider.regions.join(', ')}</small></span>
+                        {provider.featured && <em>popular</em>}
+                      </label>
+                    );
+                  })}
+                </div>
+                {sourceScrapeResult && (
+                  <section className={`source-result ${sourceScrapeResult.error ? 'failed' : ''}`}>
+                    <header><strong>{sourceScrapeResult.error ? 'Fetch needs attention' : `${sourceScrapeResult.fetched || 0} fresh jobs found`}</strong><span>{sourceScrapeResult.refreshRunId || sourceScrapeResult.error}</span></header>
+                    <div className="source-result-jobs">
+                      {(sourceScrapeResult.jobs || []).slice(0, 8).map((job) => (
+                        <a href={job.url} target="_blank" rel="noreferrer" key={job.url}><span><strong>{job.title}</strong><small>{job.company} - {job.location || 'Remote'}</small></span><ExternalLink size={15} /></a>
+                      ))}
+                    </div>
+                  </section>
+                )}
+              </div>
+            )}
+
             {portalTab === 'models' && (
               <div className="model-control-room">
                 <div className="model-room-header">
                   <div>
-                    <span className="section-kicker"><Cpu size={15} /> Open Model Runtime</span>
-                    <h3>Private local inference with hosted free fallbacks</h3>
-                    <p>Choose <strong>Free models only</strong> to keep paid providers out of the route.</p>
+                    <span className="section-kicker"><Cpu size={15} /> AI response engines</span>
+                    <h3>Automatic routing keeps answers available</h3>
+                    <p>Local engines run privately on this PC. Online engines take over when a local model is busy or unavailable.</p>
                   </div>
-                  <label className="ai-mode-control model-mode-select">
-                    <span>Active route</span>
-                    <select value={aiMode} onChange={(event) => changeAiMode(event.target.value)}>
-                      {aiModes.map((modeOption) => <option key={modeOption.id} value={modeOption.id}>{modeOption.label}</option>)}
-                    </select>
-                  </label>
+                  <div className="model-room-controls">
+                    <label className="ai-mode-control model-mode-select">
+                      <span>Answer strategy</span>
+                      <select value={aiMode} onChange={(event) => changeAiMode(event.target.value)}>
+                        {aiModes.map((modeOption) => <option key={modeOption.id} value={modeOption.id}>{modeOption.label}{modeOption.available === false ? ' (unavailable)' : ''}</option>)}
+                      </select>
+                    </label>
+                    <button onClick={runModelHealthCheck} disabled={portalBusy}><Activity size={15} /> Test engines</button>
+                  </div>
                 </div>
+
+                {modelProbeResult && (
+                  <div className="model-probe-summary">
+                    <strong>{modelProbeResult.ready || 0} ready</strong>
+                    <span>{modelProbeResult.unavailable || 0} unavailable</span>
+                    <small>Checked {modelProbeResult.checked || 0} response routes</small>
+                  </div>
+                )}
 
                 <div className="provider-grid">
                   {(freeModels?.providers || []).map((provider) => (
                     <section className={`provider-panel ${provider.reachable ? 'online' : 'offline'}`} key={provider.id}>
                       <header>
                         {provider.kind === 'local' ? <Server size={19} /> : <Cloud size={19} />}
-                        <div><strong>{provider.name}</strong><span>{provider.kind} inference</span></div>
-                        <em>{provider.reachable ? 'ready' : 'setup needed'}</em>
+                        <div><strong>{provider.name}</strong><span>{provider.kind === 'local' ? 'This PC' : provider.kind === 'hybrid' ? 'This PC and cloud' : 'Online fallback'}</span></div>
+                        <em>{provider.reachable ? 'Connected' : 'Unavailable'}</em>
                       </header>
                       <p>{provider.note}</p>
-                      <div className="model-list">
+                      <div className="model-list model-route-list">
                         {(provider.models || []).slice(0, 8).map((model) => (
-                          <span key={model.id}><i className={model.installed ? 'ready' : ''} />{cleanModelLabel(model.id)}{model.deployment === 'cloud' ? ' · cloud' : model.source === 'Hugging Face Hub' ? ' · HF Hub' : ''}</span>
+                          <div className="model-route-row" key={model.id}>
+                            <i className={model.health?.ok || model.installed ? 'ready' : ''} />
+                            <span><strong>{model.name || cleanModelLabel(model.id)}</strong><small>{model.purpose || `${model.deployment || 'hosted'} response engine`}</small></span>
+                            <em>{modelStatusLabel(model.health?.status || (model.installed ? 'ready' : 'untested'))}</em>
+                          </div>
                         ))}
                       </div>
                     </section>

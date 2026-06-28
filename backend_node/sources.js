@@ -395,6 +395,7 @@ const HN_QUERIES = [
 ];
 
 const JOB_BOARD_SOURCES = [
+    { name: "Y Combinator", host: "ycombinator.com", url: "https://www.ycombinator.com/jobs", region: "Startup / Global" },
     { name: "Naukri", host: "naukri.com", url: "https://www.naukri.com/software-developer-jobs", region: "India" },
     { name: "LinkedIn", host: "linkedin.com", url: "https://www.linkedin.com/jobs/search/?keywords=software%20engineer&location=India", region: "Global" },
     { name: "Indeed India", host: "indeed.com", url: "https://in.indeed.com/jobs?q=software+engineer&l=India", region: "India" },

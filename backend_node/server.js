@@ -72,11 +72,13 @@ const JOB_MAX_AGE_DAYS = Number(process.env.JOB_MAX_AGE_DAYS || 30);
 const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 14);
 const VIDEO_DB_RETENTION_HOURS = Number(process.env.VIDEO_DB_RETENTION_HOURS || 72);
 const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
+const OLLAMA_CLOUD_BASE_URL = String(process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com').replace(/\/$/, '');
 const OLLAMA_MODELS = String(process.env.OLLAMA_MODELS || 'qwen3:4b,glm4:9b-chat-q2_K,hf.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF:Q4_K_M,kimi-k2.6:cloud,gemma3:4b,llama3.2:3b,mistral:7b')
     .split(',').map(model => model.trim()).filter(Boolean);
 const HUGGINGFACE_MODELS = String(process.env.HUGGINGFACE_MODELS || 'Qwen/Qwen2.5-7B-Instruct,google/gemma-2-9b-it,mistralai/Mistral-7B-Instruct-v0.3')
     .split(',').map(model => model.trim()).filter(Boolean);
 const AI_MODES = ['auto', 'free', 'ollama', 'ollama-qwen', 'ollama-glm', 'ollama-hf', 'ollama-kimi', 'huggingface', 'openai', 'gemini', 'openrouter', 'offline'];
+const MODEL_COOLDOWN_MS = Number(process.env.MODEL_COOLDOWN_MS || 10 * 60 * 1000);
 let aiMode = AI_MODES.includes(String(process.env.AI_MODE || '').toLowerCase())
     ? String(process.env.AI_MODE).toLowerCase()
     : 'auto';
@@ -458,6 +460,40 @@ let aiRuntime = {
     disabledUntil: 0,
     attempts: [],
 };
+const modelHealthState = new Map();
+const modelCooldowns = new Map();
+
+function modelHealthKey(provider, model) {
+    return `${provider}:${model}`;
+}
+
+function updateModelHealth(provider, model, ok, detail = null, elapsedMs = null) {
+    modelHealthState.set(modelHealthKey(provider, model), {
+        provider,
+        model,
+        ok,
+        status: ok ? 'ready' : detail || 'failed',
+        detail,
+        elapsedMs,
+        checkedAt: new Date().toISOString(),
+    });
+}
+
+function getModelHealth(provider, model, fallbackStatus = 'not_tested') {
+    return modelHealthState.get(modelHealthKey(provider, model)) || {
+        provider,
+        model,
+        ok: fallbackStatus === 'ready',
+        status: fallbackStatus,
+        detail: null,
+        elapsedMs: null,
+        checkedAt: null,
+    };
+}
+
+function isModelCoolingDown(provider, model) {
+    return (modelCooldowns.get(modelHealthKey(provider, model)) || 0) > Date.now();
+}
 
 function parseJsonFromModel(raw) {
     if (!raw) return null;
@@ -513,6 +549,10 @@ function cleanModelText(value) {
 
 function summarizeModelError(err) {
     const status = err.response?.status;
+    const responseDetail = String(err.response?.data?.error?.message || err.response?.data?.error || err.response?.data?.message || '').toLowerCase();
+    if (responseDetail.includes('subscription')) return 'subscription_required';
+    if (responseDetail.includes('rate') || responseDetail.includes('quota')) return 'rate_limited';
+    if (responseDetail.includes('not found') || responseDetail.includes('not available')) return 'not_available';
     if (status) return `HTTP ${status}`;
     if (err.code) return err.code;
     if (err.message?.includes('quota') || err.message?.includes('429')) return 'rate_limited';
@@ -558,8 +598,11 @@ async function callOpenAIChat(prompt, modelName) {
 }
 
 async function callOllama(prompt, modelName) {
-    const res = await axios.post(`${OLLAMA_BASE_URL}/api/chat`, {
-        model: modelName,
+    const cloudRequest = modelName.endsWith(':cloud') && Boolean(process.env.OLLAMA_API_KEY);
+    const requestModel = cloudRequest ? modelName.replace(/:cloud$/, '') : modelName;
+    const endpoint = cloudRequest ? `${OLLAMA_CLOUD_BASE_URL}/api/chat` : `${OLLAMA_BASE_URL}/api/chat`;
+    const res = await axios.post(endpoint, {
+        model: requestModel,
         stream: false,
         format: 'json',
         think: false,
@@ -572,7 +615,10 @@ async function callOllama(prompt, modelName) {
             num_predict: Number(process.env.OLLAMA_NUM_PREDICT || 1200),
             num_ctx: Number(process.env.OLLAMA_CONTEXT_SIZE || 8192),
         },
-    }, { timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 180000) });
+    }, {
+        headers: cloudRequest ? { Authorization: `Bearer ${process.env.OLLAMA_API_KEY}` } : undefined,
+        timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 180000),
+    });
     return parseJsonFromModel(res.data?.message?.content || res.data?.response);
 }
 
@@ -590,6 +636,24 @@ async function callHuggingFace(prompt, modelName) {
     }, {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         timeout: Number(process.env.HUGGINGFACE_TIMEOUT_MS || 25000),
+    });
+    return parseJsonFromModel(res.data?.choices?.[0]?.message?.content);
+}
+
+async function callOpenRouter(prompt, modelName, token) {
+    const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+        model: modelName,
+        messages: [{ role: 'user', content: `${prompt}\n\nReturn ONLY valid JSON.` }],
+        temperature: 0.35,
+        max_tokens: 1200,
+    }, {
+        headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:5173',
+            'X-Title': 'World Smart News Jobs Monitor',
+        },
+        timeout: Number(process.env.OPENROUTER_TIMEOUT_MS || 20000),
     });
     return parseJsonFromModel(res.data?.choices?.[0]?.message?.content);
 }
@@ -614,26 +678,36 @@ async function getAIInsight(prompt) {
     }
     const allowOpenAI = aiMode === 'auto' || aiMode === 'openai';
     const allowGemini = aiMode === 'auto' || aiMode === 'gemini';
-    const allowOpenRouter = aiMode === 'auto' || aiMode === 'free' || aiMode === 'openrouter';
+    const allowOpenRouter = aiMode !== 'offline' && (
+        aiMode === 'auto' || aiMode === 'free' || aiMode === 'openrouter' ||
+        aiMode === 'huggingface' || aiMode.startsWith('ollama')
+    );
     const allowOllama = aiMode.startsWith('ollama') || aiMode === 'free' || (aiMode === 'auto' && String(process.env.OLLAMA_ENABLED || '').toLowerCase() === 'true');
-    const allowHuggingFace = aiMode === 'huggingface' || aiMode === 'free' || (aiMode === 'auto' && Boolean(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN));
+    const allowHuggingFace = aiMode === 'huggingface' || aiMode === 'free' ||
+        ((aiMode === 'auto' || aiMode.startsWith('ollama')) && Boolean(process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN));
     const attempts = [];
     const recordFailure = (provider, model, err) => {
         const error = summarizeModelError(err);
         attempts.push({ provider, model, ok: false, error });
         aiRuntime.lastError = `${provider}/${model}: ${error}`;
+        updateModelHealth(provider, model, false, error);
+        if (/HTTP (402|404|429)|rate_limited|subscription|quota|not_available/i.test(error)) {
+            modelCooldowns.set(modelHealthKey(provider, model), Date.now() + MODEL_COOLDOWN_MS);
+        }
         if (aiMode !== 'auto' && ['HTTP 402', 'HTTP 429', 'rate_limited'].includes(error)) {
             aiRuntime.disabledUntil = Math.max(aiRuntime.disabledUntil, Date.now() + AI_CIRCUIT_BREAKER_MS);
         }
     };
     const recordSuccess = (provider, model, data) => {
         attempts.push({ provider, model, ok: true });
+        updateModelHealth(provider, model, true);
+        modelCooldowns.delete(modelHealthKey(provider, model));
         aiRuntime = { lastProvider: provider, lastModel: model, lastError: null, disabledUntil: 0, attempts, mode: aiMode };
         return data;
     };
 
     if (allowOllama) {
-        const ollamaCandidates = aiMode === 'ollama-qwen'
+        const preferredOllamaCandidates = aiMode === 'ollama-qwen'
             ? OLLAMA_MODELS.filter(model => /qwen/i.test(model))
             : aiMode === 'ollama-glm'
                 ? OLLAMA_MODELS.filter(model => /glm/i.test(model))
@@ -642,7 +716,11 @@ async function getAIInsight(prompt) {
                 : aiMode === 'ollama-kimi'
                     ? OLLAMA_MODELS.filter(model => /kimi/i.test(model))
                     : OLLAMA_MODELS;
+        const ollamaCandidates = aiMode.startsWith('ollama-')
+            ? [...preferredOllamaCandidates, ...OLLAMA_MODELS.filter(model => !preferredOllamaCandidates.includes(model))]
+            : preferredOllamaCandidates;
         for (const modelName of ollamaCandidates) {
+            if (isModelCoolingDown('Ollama', modelName)) continue;
             try {
                 return recordSuccess('Ollama', modelName, await callOllama(prompt, modelName));
             } catch (error) {
@@ -654,6 +732,7 @@ async function getAIInsight(prompt) {
 
     if (allowHuggingFace) {
         for (const modelName of HUGGINGFACE_MODELS) {
+            if (isModelCoolingDown('Hugging Face', modelName)) continue;
             try {
                 return recordSuccess('Hugging Face', modelName, await callHuggingFace(prompt, modelName));
             } catch (error) {
@@ -664,6 +743,7 @@ async function getAIInsight(prompt) {
 
     if (allowOpenAI && process.env.OPENAI_API_KEY) {
         for (const modelName of [OPENAI_MODEL, ...OPENAI_FALLBACK_MODELS]) {
+            if (isModelCoolingDown('OpenAI Responses', modelName)) continue;
             try {
                 return recordSuccess('OpenAI Responses', modelName, await callOpenAIResponses(prompt, modelName));
             } catch (e) {
@@ -684,6 +764,7 @@ async function getAIInsight(prompt) {
     ];
     if (allowGemini && genAI) {
         for (const m of geminiModels) {
+            if (isModelCoolingDown('Gemini', m.model)) continue;
             try {
                 const model = genAI.getGenerativeModel({ model: m.model, generationConfig: { responseMimeType: "application/json" } });
                 const result = await model.generateContent(prompt);
@@ -704,22 +785,9 @@ async function getAIInsight(prompt) {
 
     if (allowOpenRouter) {
         for (const m of orModels) {
+            if (isModelCoolingDown('OpenRouter', m.model)) continue;
             try {
-            const res = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-                model: m.model,
-                messages: [{ role: "user", content: prompt + "\n\nReturn ONLY valid JSON." }],
-                temperature: 0.5,
-                max_tokens: 1500
-            }, {
-                headers: {
-                    "Authorization": `Bearer ${m.token}`,
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "http://localhost:5173",
-                    "X-Title": "World Smart News Jobs Monitor",
-                },
-                timeout: API_TIMEOUT
-            });
-                return recordSuccess('OpenRouter', m.model, parseJsonFromModel(res.data.choices[0].message.content));
+                return recordSuccess('OpenRouter', m.model, await callOpenRouter(prompt, m.model, m.token));
             } catch (e) {
                 recordFailure('OpenRouter', m.model, e);
             }
@@ -846,7 +914,7 @@ function extractAnchorJobs(html, source) {
     while ((match = anchorRegex.exec(html)) && jobs.length < 20) {
         const href = match[1];
         const text = cleanText(match[2]);
-        const detailUrl = /(\/jobs?\/view\/\d+|\/job\/[^?#]+|[?&]job[_-]?id=|[?&]jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(?:y|ies)\/[^?#]+|\/project\/\d+)/i.test(href);
+        const detailUrl = /(\/jobs?\/view\/\d+|\/companies\/[^/?#]+\/jobs\/[^?#]+|\/job\/[^?#]+|[?&]job[_-]?id=|[?&]jk=|viewjob|job-listing|job-details?|jobdetail|\/opportunit(?:y|ies)\/[^?#]+|\/project\/\d+)/i.test(href);
         const looksLikeJob = detailUrl && ROLE_TITLE_PATTERN.test(text) && !NON_JOB_ANCHOR_PATTERN.test(text);
         if (!looksLikeJob || text.length < 8 || text.length > 140 || !isLikelyPersistableJob({ title: text, source: source.name })) continue;
         const url = absoluteUrl(href, source.url);
@@ -866,9 +934,74 @@ function extractAnchorJobs(html, source) {
     return jobs;
 }
 
-async function getBoardSourceJobs() {
-    console.log(`Scraping ${JOB_BOARD_SOURCES.length} configured job board pages...`);
-    return fetchBatched(JOB_BOARD_SOURCES, async (source) => {
+const SOURCE_LABELS_BY_HOST = {
+    'weworkremotely.com': 'We Work Remotely',
+    'remoteok.com': 'Remote OK',
+    'stackoverflow.com': 'Stack Overflow Jobs',
+    'jobicy.com': 'Jobicy',
+    'authenticjobs.com': 'Authentic Jobs',
+    'workingnomads.com': 'Working Nomads',
+    'ycombinator.com': 'Y Combinator',
+};
+
+function jobSourceProviderLabel(kind, source) {
+    if (kind === 'api') {
+        if (/^Remotive/i.test(source.name)) return 'Remotive';
+        if (/^TheMuse/i.test(source.name)) return 'The Muse';
+        if (/^HN-Jobs/i.test(source.name)) return 'Hacker News Jobs';
+        return source.name;
+    }
+    if (kind === 'board') return source.name;
+    try {
+        const host = new URL(source).hostname.replace(/^www\./, '');
+        if (host === 'indeed.com' || host.endsWith('.indeed.com')) return 'Indeed';
+        if (host === 'linkedin.com' || host.endsWith('.linkedin.com')) return 'LinkedIn';
+        return SOURCE_LABELS_BY_HOST[host] || host.split('.').slice(0, -1).join(' ').replace(/(^|\s)\w/g, letter => letter.toUpperCase());
+    } catch (_) {
+        return String(source);
+    }
+}
+
+function jobSourceProviderId(label) {
+    return `provider-${hashString(String(label).toLowerCase())}`;
+}
+
+function getJobSourceCatalog() {
+    const providers = new Map();
+    const add = (kind, source, region = 'Global') => {
+        const label = jobSourceProviderLabel(kind, source);
+        const id = jobSourceProviderId(label);
+        const current = providers.get(id) || { id, label, kinds: new Set(), sourceCount: 0, regions: new Set(), featured: false };
+        current.kinds.add(kind);
+        current.sourceCount += 1;
+        current.regions.add(region || 'Global');
+        current.featured = current.featured || /LinkedIn|Naukri|Indeed|Y Combinator|Wellfound|Internshala|Remote OK|Hacker News/i.test(label);
+        providers.set(id, current);
+    };
+    JOB_APIS.forEach(source => add('api', source, source.type === 'remotive' ? 'Remote' : 'Global'));
+    JOB_RSS_FEEDS.forEach(url => add('rss', url, /naukri|hirist|indeed\.com/i.test(url) ? 'India' : 'Global'));
+    JOB_BOARD_SOURCES.forEach(source => add('board', source, source.region));
+    return [...providers.values()].map(item => ({ ...item, kinds: [...item.kinds], regions: [...item.regions] }))
+        .sort((a, b) => Number(b.featured) - Number(a.featured) || a.label.localeCompare(b.label));
+}
+
+function resolveJobSourceSelection(sourceIds = []) {
+    if (!Array.isArray(sourceIds) || sourceIds.length === 0) {
+        return { apis: JOB_APIS, rss: JOB_RSS_FEEDS, boards: JOB_BOARD_SOURCES, providers: getJobSourceCatalog() };
+    }
+    const selected = new Set(sourceIds);
+    const include = (kind, source) => selected.has(jobSourceProviderId(jobSourceProviderLabel(kind, source)));
+    return {
+        apis: JOB_APIS.filter(source => include('api', source)),
+        rss: JOB_RSS_FEEDS.filter(source => include('rss', source)),
+        boards: JOB_BOARD_SOURCES.filter(source => include('board', source)),
+        providers: getJobSourceCatalog().filter(provider => selected.has(provider.id)),
+    };
+}
+
+async function getBoardSourceJobs(boardSources = JOB_BOARD_SOURCES) {
+    console.log(`Scraping ${boardSources.length} configured job board pages...`);
+    return fetchBatched(boardSources, async (source) => {
         try {
             const res = await axios.get(source.url, {
                 timeout: API_TIMEOUT,
@@ -895,12 +1028,13 @@ async function getBoardSourceJobs() {
     }, 4);
 }
 
-const getScrapedJobs = async (refreshRunId = null) => {
+const getScrapedJobs = async (refreshRunId = null, sourceIds = []) => {
+    const selectedSources = resolveJobSourceSelection(sourceIds);
     console.log(`📡 Scraping jobs from ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS feeds + ${JOB_BOARD_SOURCES.length} board scrapers...`);
     const jobs = [];
 
     // 1. Fetch from APIs
-    const apiJobs = await fetchBatched(JOB_APIS, async (source) => {
+    const apiJobs = await fetchBatched(selectedSources.apis, async (source) => {
         try {
             const res = await axios.get(source.url, { timeout: API_TIMEOUT });
             const items = [];
@@ -937,7 +1071,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
     });
 
     // 2. Fetch from RSS
-    const rssJobs = await fetchBatched(JOB_RSS_FEEDS, async (feedUrl) => {
+    const rssJobs = await fetchBatched(selectedSources.rss, async (feedUrl) => {
         try {
             const feed = await parser.parseURL(feedUrl);
             const items = (feed.items || []).slice(0, 15).map(item => ({
@@ -955,7 +1089,7 @@ const getScrapedJobs = async (refreshRunId = null) => {
         }
     });
 
-    const boardJobs = await getBoardSourceJobs();
+    const boardJobs = await getBoardSourceJobs(selectedSources.boards);
     const allRawJobs = [...apiJobs, ...rssJobs, ...boardJobs];
 
     // Deduplicate by URL
@@ -1854,6 +1988,7 @@ let cache = {
 let isRefreshing = false;
 let isVideoRefreshing = false;
 let videoRefreshPromise = null;
+let sourceScrapePromise = null;
 const REFRESH_RESPONSE_WAIT_MS = Number(process.env.REFRESH_RESPONSE_WAIT_MS || 45000);
 
 function makeRefreshRunId() {
@@ -2032,6 +2167,64 @@ function getDashboardPayload(extra = {}) {
     };
 }
 
+const MODEL_ROUTE_DEFINITIONS = [
+    { id: 'ollama-qwen', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /qwen/i.test(item)), name: 'Qwen local', location: 'On this PC', purpose: 'Fast private default' },
+    { id: 'ollama-glm', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /glm/i.test(item)), name: 'GLM local', location: 'On this PC', purpose: 'Private reasoning fallback' },
+    { id: 'ollama-hf', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /hf\.co|huggingface/i.test(item)), name: 'Hugging Face local', location: 'On this PC', purpose: 'Lightweight private fallback' },
+    { id: 'huggingface', provider: 'Hugging Face', model: () => HUGGINGFACE_MODELS[0], name: 'Hugging Face hosted', location: 'Hosted', purpose: 'Fast open-model fallback' },
+    { id: 'ollama-kimi', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /kimi/i.test(item)), name: 'Kimi Cloud', location: 'Hosted', purpose: 'Long-context reasoning' },
+    { id: 'openrouter', provider: 'OpenRouter', model: () => OPENROUTER_MODELS[0], name: 'OpenRouter', location: 'Hosted', purpose: 'Multi-model fallback router' },
+    { id: 'offline', provider: 'Deterministic', model: () => 'evidence-fallback-v2', name: 'Offline fallback', location: 'On this server', purpose: 'Always-available factual output' },
+];
+
+let modelProbePromise = null;
+
+async function probeModelRoute(definition) {
+    const model = definition.model();
+    const started = Date.now();
+    if (!model) {
+        updateModelHealth(definition.provider, definition.id, false, 'not_configured');
+        return { ...definition, model: null, ok: false, status: 'not_configured', elapsedMs: 0 };
+    }
+    if (definition.id === 'offline') {
+        updateModelHealth(definition.provider, model, true, null, 0);
+        return { ...definition, model, ok: true, status: 'ready', elapsedMs: 0 };
+    }
+    try {
+        const prompt = 'Return JSON only: {"status":"ready"}';
+        let result;
+        if (definition.id.startsWith('ollama-')) result = await callOllama(prompt, model);
+        else if (definition.id === 'huggingface') result = await callHuggingFace(prompt, model);
+        else if (definition.id === 'openrouter') {
+            const token = getOpenRouterTokens()[0];
+            if (!token) throw new Error('OPENROUTER_API_KEY is not configured');
+            result = await callOpenRouter(prompt, model, token);
+        }
+        if (!result) throw new Error('empty_model_response');
+        const elapsedMs = Date.now() - started;
+        updateModelHealth(definition.provider, model, true, null, elapsedMs);
+        modelCooldowns.delete(modelHealthKey(definition.provider, model));
+        return { ...definition, model, ok: true, status: 'ready', elapsedMs };
+    } catch (error) {
+        const status = summarizeModelError(error);
+        const elapsedMs = Date.now() - started;
+        updateModelHealth(definition.provider, model, false, status, elapsedMs);
+        if (/subscription|required|rate_limited|not_available|HTTP (402|404|429)/i.test(status)) {
+            modelCooldowns.set(modelHealthKey(definition.provider, model), Date.now() + MODEL_COOLDOWN_MS);
+        }
+        return { ...definition, model, ok: false, status, elapsedMs };
+    }
+}
+
+async function probeModelRoutes(routeIds = []) {
+    const selected = routeIds.length
+        ? MODEL_ROUTE_DEFINITIONS.filter(item => routeIds.includes(item.id))
+        : MODEL_ROUTE_DEFINITIONS;
+    const results = [];
+    for (const definition of selected) results.push(await probeModelRoute(definition));
+    return results;
+}
+
 app.get('/', (req, res) => {
     res.send('<h1>✅ Smart News & Job Tracker API Backend is Running!</h1><p>Use /api/dashboard-data to access the endpoints.</p>');
 });
@@ -2052,6 +2245,20 @@ app.post('/api/ai-modes', (req, res) => {
     res.json(getAIModePayload());
 });
 
+app.post('/api/model-health-check', async (req, res) => {
+    const routeIds = Array.isArray(req.body?.routeIds) ? req.body.routeIds.slice(0, 8) : [];
+    if (!modelProbePromise) {
+        modelProbePromise = probeModelRoutes(routeIds).finally(() => { modelProbePromise = null; });
+    }
+    const results = await modelProbePromise;
+    res.json({
+        checkedAt: new Date().toISOString(),
+        ready: results.filter(item => item.ok).length,
+        unavailable: results.filter(item => !item.ok).length,
+        results,
+    });
+});
+
 app.get('/api/free-models', async (req, res) => {
     const [ollama, bridge] = await Promise.all([inspectOllama(), getDailyNewsBridgeStatus()]);
     const huggingFaceToken = process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
@@ -2065,12 +2272,21 @@ app.get('/api/free-models', async (req, res) => {
                 configured: true,
                 reachable: ollama.reachable,
                 endpoint: ollama.endpoint,
-                models: OLLAMA_MODELS.map(id => ({
-                    id,
-                    installed: ollama.installed.includes(id),
-                    deployment: id.endsWith(':cloud') ? 'cloud' : 'local',
-                    source: /hf\.co|huggingface/i.test(id) ? 'Hugging Face Hub' : 'Ollama Library',
-                })),
+                models: OLLAMA_MODELS.map(id => {
+                    const definition = MODEL_ROUTE_DEFINITIONS.find(item => item.model() === id);
+                    const fallbackStatus = id.endsWith(':cloud')
+                        ? (process.env.OLLAMA_API_KEY ? 'configured' : 'authorization_required')
+                        : (ollama.installed.includes(id) ? 'installed' : 'not_installed');
+                    return {
+                        id,
+                        name: definition?.name || id,
+                        purpose: definition?.purpose || 'Optional local fallback',
+                        installed: ollama.installed.includes(id),
+                        deployment: id.endsWith(':cloud') ? 'cloud' : 'local',
+                        source: /hf\.co|huggingface/i.test(id) ? 'Hugging Face Hub' : 'Ollama Library',
+                        health: getModelHealth('Ollama', id, fallbackStatus),
+                    };
+                }),
                 installed: ollama.installed,
                 note: ollama.reachable ? 'Local inference is ready; configured cloud models remain explicitly labeled.' : 'Start Ollama locally or configure OLLAMA_BASE_URL on a reachable host.',
             },
@@ -2080,7 +2296,14 @@ app.get('/api/free-models', async (req, res) => {
                 kind: 'hosted',
                 configured: getOpenRouterTokens().length > 0,
                 reachable: getOpenRouterTokens().length > 0,
-                models: OPENROUTER_MODELS.map(id => ({ id, installed: true })),
+                models: OPENROUTER_MODELS.map(id => ({
+                    id,
+                    name: id === 'openrouter/free' ? 'OpenRouter automatic fallback' : cleanText(id.split('/').pop()),
+                    purpose: id === 'openrouter/free' ? 'Chooses an available free model' : 'Hosted fallback model',
+                    installed: true,
+                    deployment: 'hosted',
+                    health: getModelHealth('OpenRouter', id, getOpenRouterTokens().length ? 'configured' : 'not_configured'),
+                })),
                 note: 'Free-model router with automatic per-model fallback.',
             },
             {
@@ -2089,11 +2312,18 @@ app.get('/api/free-models', async (req, res) => {
                 kind: 'hosted',
                 configured: Boolean(huggingFaceToken),
                 reachable: Boolean(huggingFaceToken),
-                models: HUGGINGFACE_MODELS.map(id => ({ id, installed: true })),
+                models: HUGGINGFACE_MODELS.map(id => ({
+                    id,
+                    name: cleanText(id.split('/').pop()),
+                    purpose: id === HUGGINGFACE_MODELS[0] ? 'Primary hosted open model' : 'Hosted fallback model',
+                    installed: true,
+                    deployment: 'hosted',
+                    health: getModelHealth('Hugging Face', id, huggingFaceToken ? 'configured' : 'not_configured'),
+                })),
                 note: huggingFaceToken ? 'Open-source hosted inference is configured.' : 'Set HUGGINGFACE_API_KEY or HF_TOKEN to enable hosted inference.',
             },
         ],
-        routing: ['Ollama local', 'Hugging Face', 'OpenRouter free', 'deterministic offline fallback'],
+        routing: ['Qwen local', 'GLM local', 'Hugging Face local', 'Hugging Face hosted', 'Kimi Cloud when entitled', 'OpenRouter free', 'deterministic offline fallback'],
         lastRuntime: getAIModePayload().runtime,
         dailyNewsUpdate: bridge,
     });
@@ -2128,6 +2358,7 @@ app.get('/api/source-health', (req, res) => {
 });
 
 app.get('/api/source-registry', (req, res) => {
+    const providers = getJobSourceCatalog();
     res.json({
         counts: {
             apis: JOB_APIS.length,
@@ -2143,7 +2374,45 @@ app.get('/api/source-registry', (req, res) => {
             region: source.region,
             mode: 'resilient_html_probe',
         })),
+        providers,
+        featuredProviderIds: providers.filter(provider => provider.featured).map(provider => provider.id),
     });
+});
+
+app.post('/api/portal-scrape-sources', async (req, res) => {
+    const sourceIds = [...new Set(Array.isArray(req.body?.sourceIds) ? req.body.sourceIds.map(String) : [])].slice(0, 12);
+    if (!sourceIds.length) return res.status(400).json({ error: 'source_selection_required' });
+    const selected = resolveJobSourceSelection(sourceIds);
+    if (!selected.providers.length) return res.status(400).json({ error: 'unknown_sources' });
+    if (sourceScrapePromise) return res.status(202).json({ status: 'already_scraping', selected: selected.providers });
+
+    const refreshRunId = makeRefreshRunId();
+    sourceScrapePromise = getScrapedJobs(refreshRunId, sourceIds);
+    try {
+        const freshJobs = await sourceScrapePromise;
+        const existingJobs = (cache.dashboardData || []).filter(item => item.type === 'job');
+        const existingNews = (cache.dashboardData || []).filter(item => item.type !== 'job');
+        const seen = new Set();
+        const mergedJobs = [...freshJobs, ...existingJobs].filter(job => {
+            const key = canonicalSourceUrl(job.url) || `${job.title}:${job.company}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).sort((a, b) => getTimestamp(b.publishedAt || b.sourcePublishedAt) - getTimestamp(a.publishedAt || a.sourcePublishedAt)).slice(0, 500);
+        cache.dashboardData = [...mergedJobs, ...existingNews].sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0));
+        cache.stats = { ...cache.stats, totalJobs: mergedJobs.length, lastSourceScrapeISO: new Date().toISOString(), lastSourceScrapeRunId: refreshRunId };
+        res.json({
+            status: 'completed',
+            refreshRunId,
+            selected: selected.providers,
+            fetched: freshJobs.length,
+            jobs: freshJobs.slice(0, 100),
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'source_scrape_failed', detail: summarizeModelError(error) });
+    } finally {
+        sourceScrapePromise = null;
+    }
 });
 
 app.post('/api/refresh', async (req, res) => {
