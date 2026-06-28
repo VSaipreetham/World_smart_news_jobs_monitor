@@ -1118,6 +1118,36 @@ main {
   background: #101828;
 }
 
+.video-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.video-pager button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.video-pager button:disabled { cursor: default; opacity: 0.45; }
+.video-pager span { color: var(--text-tertiary); font-size: 11px; font-weight: 750; }
+
 .portal-strip {
   display: flex;
   align-items: center;
@@ -1232,6 +1262,57 @@ main {
   width: min(560px, 100%);
   padding: 22px;
 }
+
+.career-desk-surface {
+  border-top: 4px solid #1457d9;
+}
+
+.model-console-surface {
+  border-color: #96a69f;
+  border-top: 4px solid #13a36f;
+  background: #f5f8f6;
+}
+
+.model-console-surface > .workspace-header {
+  margin: -22px -22px 16px;
+  padding: 20px 60px 18px 22px;
+  background: #17201c;
+  color: #ffffff;
+}
+
+.model-console-surface > .workspace-header p,
+.model-console-surface > .workspace-header span { color: #b8cec4; }
+
+.model-console-surface .portal-tabs button.active {
+  border-color: #138a61;
+  background: #138a61;
+}
+
+.model-console-banner {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0 0 16px;
+  overflow: hidden;
+  border: 1px solid #c9d5cf;
+  border-radius: 7px;
+  background: #c9d5cf;
+}
+
+.model-console-banner > div {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+  padding: 13px;
+  background: #ffffff;
+  color: #146c50;
+}
+
+.model-console-banner span,
+.model-console-banner strong { display: block; min-width: 0; }
+.model-console-banner span { color: #667085; font-size: 11px; }
+.model-console-banner strong { margin-top: 3px; color: #18231e; font-size: 13px; }
 
 .portal-modal {
   width: min(1320px, 100%);
@@ -2062,6 +2143,7 @@ main {
 
   .provider-grid,
   .source-provider-grid,
+  .model-console-banner,
   .runtime-grid {
     grid-template-columns: 1fr;
   }

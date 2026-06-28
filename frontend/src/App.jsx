@@ -6,6 +6,8 @@ import {
   Bot,
   Briefcase,
   Building2,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   Cloud,
   Compass,
@@ -39,11 +41,12 @@ import './App.css';
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 const FEED_LIMIT = 80;
 const PORTAL_LIMIT = 18;
+const VIDEO_PAGE_SIZE = 24;
 
 const API_BASES = [
-  API_BASE,
-  API_BASE ? '' : null,
+  import.meta.env.DEV ? '' : null,
   import.meta.env.DEV ? 'http://127.0.0.1:8000' : null,
+  API_BASE,
 ].filter((base, index, items) => base !== null && items.indexOf(base) === index);
 
 function apiUrl(path, base = API_BASES[0] || '') {
@@ -64,6 +67,14 @@ async function apiFetch(path, options) {
   }
   if (lastResponse) return lastResponse;
   throw lastError || new Error('api_unavailable');
+}
+
+async function readApiJson(response) {
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new Error(`API route unavailable (${response.status}). Restart or redeploy the backend.`);
+  }
+  return response.json();
 }
 
 function formatAge(seconds) {
@@ -142,6 +153,8 @@ function modelStatusLabel(status) {
     subscription_required: 'Plan required',
     rate_limited: 'Cooling down',
     not_available: 'Unavailable',
+    insufficient_memory: 'Needs more RAM',
+    runtime_crash: 'Runtime failed',
   };
   return labels[status] || 'Needs attention';
 }
@@ -206,6 +219,9 @@ export default function App() {
   const [data, setData] = useState([]);
   const [trends, setTrends] = useState([]);
   const [videos, setVideos] = useState([]);
+  const [videoPage, setVideoPage] = useState(1);
+  const [videoTotal, setVideoTotal] = useState(0);
+  const [videoTotalPages, setVideoTotalPages] = useState(1);
   const [health, setHealth] = useState(null);
   const [stats, setStats] = useState({});
   const [insight, setInsight] = useState({ summary_news: 'Building live intelligence brief.', summary_jobs: 'Scanning current hiring signals.' });
@@ -269,12 +285,23 @@ export default function App() {
     if (healthRes.status === 'fulfilled' && healthRes.value.ok) setSourceHealth(await healthRes.value.json());
   }, []);
 
+  const fetchVideoPage = useCallback(async (page = 1, refresh = false) => {
+    const params = new URLSearchParams({ page: String(page), limit: String(VIDEO_PAGE_SIZE) });
+    if (refresh) params.set('refresh', '1');
+    const res = await apiFetch(`/api/videos?${params.toString()}`);
+    if (!res.ok) return;
+    const json = await res.json();
+    setVideos(normalizeVideos(json.videos || []));
+    setVideoPage(json.page || page);
+    setVideoTotal(json.total || 0);
+    setVideoTotalPages(json.totalPages || 1);
+  }, []);
+
   const fetchDashboard = useCallback(async () => {
     const dashPromise = apiFetch('/api/dashboard-data').then(async (res) => {
       if (!res.ok) return;
-      const json = await res.json();
+      const json = await readApiJson(res);
       setData(json.data || []);
-      setVideos(normalizeVideos(json.videos || []));
       setTrends(json.trends || []);
       setStats(json.stats || {});
       setHealth(json.health || null);
@@ -300,15 +327,10 @@ export default function App() {
           ...current,
           insight: { provider: json.provider, model: json.model, fallback: json.fallback },
         }));
-        setVideos(normalizeVideos(json.videos || []));
       }),
-      apiFetch('/api/videos').then(async (res) => {
-        if (!res.ok) return;
-        const json = await res.json();
-        if (json.videos?.length) setVideos(normalizeVideos(json.videos));
-      }),
+      fetchVideoPage(1),
     ]);
-  }, []);
+  }, [fetchVideoPage]);
 
   useEffect(() => {
     let mounted = true;
@@ -352,7 +374,40 @@ export default function App() {
       if (portalOpen) {
         await Promise.all([fetchPortalJobs(1, portalQuery, portalStatus), fetchPortalAnalytics(), fetchOperationalConfig()]);
       }
+      await fetchVideoPage(1);
     } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const refreshJobs = async () => {
+    setIsRefreshing(true);
+    setPortalBusy(true);
+    setBusyLabel('Fetching current jobs from live sources');
+    try {
+      const res = await apiFetch('/api/jobs/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const json = await readApiJson(res);
+      if (!res.ok) throw new Error(json.detail || json.error || 'job_refresh_failed');
+      addToast('Live source refresh started', 'success');
+      let result = json;
+      for (let attempt = 0; attempt < 48 && result.status === 'running'; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 5000));
+        const statusResponse = await apiFetch('/api/jobs/refresh-status');
+        result = await readApiJson(statusResponse);
+      }
+      if (result.status === 'failed') throw new Error(result.error || 'job_refresh_failed');
+      if (result.status === 'completed') addToast(`${result.fetched || 0} current jobs fetched`, 'success');
+      else addToast('Refresh is still running in the background', 'info');
+      await Promise.all([fetchDashboard(), fetchPortalJobs(1, portalQuery, portalStatus), fetchPortalAnalytics(), fetchOperationalConfig()]);
+    } catch (error) {
+      addToast(`Job refresh failed: ${error.message}`, 'error');
+    } finally {
+      setPortalBusy(false);
+      setBusyLabel('');
       setIsRefreshing(false);
     }
   };
@@ -1126,11 +1181,11 @@ export default function App() {
           <div className="workspace">
             <div className="workspace-header">
               <h2><Video size={19} /> Video Watchlist</h2>
-              <span>{videos.length}</span>
+              <span>{videoTotal || videos.length}</span>
             </div>
             <div className="video-list">
               {(isLoading || isRefreshing) && videos.length === 0 && <SkeletonRows count={4} media />}
-              {videos.slice(0, 24).map((video) => (
+              {videos.map((video) => (
                 <a className="video-row" href={`https://www.youtube.com/watch?v=${video.videoId}`} target="_blank" rel="noreferrer" key={video.videoId}>
                   <img src={`https://img.youtube.com/vi/${video.videoId}/mqdefault.jpg`} alt="" loading="lazy" />
                   <span>
@@ -1140,6 +1195,12 @@ export default function App() {
                 </a>
               ))}
               {videos.length === 0 && !isLoading && !isRefreshing && <EmptyState title="Video queue is empty." />}
+            </div>
+            <div className="video-pager">
+              <button disabled={videoPage <= 1 || isRefreshing} onClick={() => fetchVideoPage(videoPage - 1)}><ChevronLeft size={15} /> Previous</button>
+              <span>Page {videoPage} of {videoTotalPages}</span>
+              <button disabled={videoPage >= videoTotalPages || isRefreshing} onClick={() => fetchVideoPage(videoPage + 1)}>Next <ChevronRight size={15} /></button>
+              <button className="icon-button" onClick={() => fetchVideoPage(1, true)} disabled={isRefreshing} title="Fetch newer videos"><RefreshCcw size={15} /></button>
             </div>
           </div>
         </section>
@@ -1177,7 +1238,7 @@ export default function App() {
 
       {portalOpen && (
         <div className="modal-backdrop" onClick={() => setPortalOpen(false)}>
-          <div className="portal-modal" onClick={(event) => event.stopPropagation()}>
+          <div className={`portal-modal ${portalTab === 'models' ? 'model-console-surface' : 'career-desk-surface'}`} onClick={(event) => event.stopPropagation()}>
             <button className="modal-close" onClick={() => setPortalOpen(false)} title="Close"><X size={18} /></button>
             {portalBusy && (
               <div className="portal-busy">
@@ -1188,29 +1249,37 @@ export default function App() {
             )}
             <div className="workspace-header">
               <div>
-                <h2><Briefcase size={20} /> Smart Job Portal Pro</h2>
-                <p>{sourceRegistry?.counts?.boards || 0} board probes, {sourceRegistry?.counts?.apis || 0} APIs, {sourceRegistry?.counts?.rss || 0} feeds</p>
+                <h2>{portalTab === 'models' ? <><Cpu size={20} /> AI Runtime Console</> : <><Briefcase size={20} /> Career Operations Desk</>}</h2>
+                <p>{portalTab === 'models' ? 'Private local reasoning with measured hosted fallbacks' : `${sourceRegistry?.counts?.boards || 0} boards, ${sourceRegistry?.counts?.apis || 0} APIs, ${sourceRegistry?.counts?.rss || 0} feeds`}</p>
               </div>
-              <span>{portalTotal || portalAnalytics?.totals?.jobs || 0} roles</span>
+              <span>{portalTab === 'models' ? `${modelProbeResult?.ready || 0} engines ready` : `${portalTotal || portalAnalytics?.totals?.jobs || 0} roles`}</span>
             </div>
-            <div className="portal-command">
-              <Metric icon={Briefcase} label="Tracked" value={portalAnalytics?.totals?.jobs || portalTotal || 0} />
-              <Metric icon={Activity} label="Applied" value={portalAnalytics?.totals?.applied || 0} />
-              <Metric icon={ShieldCheck} label="Interviews" value={portalAnalytics?.totals?.interviews || 0} />
-              <label className="ai-mode-control">
-                <span>AI mode</span>
-                <select value={aiMode} onChange={(event) => changeAiMode(event.target.value)}>
-                  {(aiModes.length ? aiModes : [{ id: 'auto', label: 'Auto fallback' }, { id: 'offline', label: 'Offline deterministic' }]).map((modeOption) => (
-                    <option key={modeOption.id} value={modeOption.id}>
-                      {modeOption.label}{modeOption.available === false ? ' (not configured)' : ''}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button className="primary-button" onClick={forceRefresh} disabled={isRefreshing}>
-                <RefreshCcw size={16} /> {isRefreshing ? 'Refreshing' : 'Refresh'}
-              </button>
-            </div>
+            {portalTab === 'models' ? (
+              <div className="model-console-banner">
+                <div><Server size={18} /><span>Local first<strong>{freeModels?.providers?.find((provider) => provider.id === 'ollama')?.installed?.length || 0} installed</strong></span></div>
+                <div><Cloud size={18} /><span>Hosted backup<strong>{freeModels?.providers?.filter((provider) => provider.id !== 'ollama' && provider.reachable).length || 0} connected</strong></span></div>
+                <div><ShieldCheck size={18} /><span>Final safety net<strong>Offline evidence mode</strong></span></div>
+              </div>
+            ) : (
+              <div className="portal-command">
+                <Metric icon={Briefcase} label="Tracked" value={portalAnalytics?.totals?.jobs || portalTotal || 0} />
+                <Metric icon={Activity} label="Applied" value={portalAnalytics?.totals?.applied || 0} />
+                <Metric icon={ShieldCheck} label="Interviews" value={portalAnalytics?.totals?.interviews || 0} />
+                <label className="ai-mode-control">
+                  <span>AI mode</span>
+                  <select value={aiMode} onChange={(event) => changeAiMode(event.target.value)}>
+                    {(aiModes.length ? aiModes : [{ id: 'auto', label: 'Auto fallback' }, { id: 'offline', label: 'Offline deterministic' }]).map((modeOption) => (
+                      <option key={modeOption.id} value={modeOption.id}>
+                        {modeOption.label}{modeOption.available === false ? ' (not configured)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button className="primary-button" onClick={refreshJobs} disabled={isRefreshing}>
+                  <RefreshCcw size={16} /> {isRefreshing ? 'Fetching jobs' : 'Refresh current jobs'}
+                </button>
+              </div>
+            )}
             <div className="portal-tabs">
               {[
                 ['inbox', 'Inbox'],

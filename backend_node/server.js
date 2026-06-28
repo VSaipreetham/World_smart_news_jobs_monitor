@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 require('dotenv').config();
 require('dotenv').config({ path: path.resolve(__dirname, '../backend/.env'), override: false });
 try {
@@ -60,36 +61,41 @@ const OPENAI_FALLBACK_MODELS = (process.env.OPENAI_FALLBACK_MODELS || 'gpt-5.4,g
     .map(m => m.trim())
     .filter(Boolean);
 const DEFAULT_OPENROUTER_MODELS = [
-    'openrouter/free',
+    'openai/gpt-oss-120b:free',
+    'nvidia/nemotron-3-super-120b-a12b:free',
+    'poolside/laguna-m.1:free',
+    'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    'liquid/lfm-2.5-1.2b-thinking:free',
     'google/gemma-4-26b-a4b-it:free',
     'google/gemma-4-31b-it:free',
     'qwen/qwen3-next-80b-a3b-instruct:free',
-    'openai/gpt-oss-120b:free',
     'openai/gpt-oss-20b:free',
     'qwen/qwen3-coder:free',
-    'nvidia/nemotron-3-super-120b-a12b:free',
     'nvidia/nemotron-3-nano-30b-a3b:free',
     'meta-llama/llama-3.3-70b-instruct:free',
     'cohere/north-mini-code:free',
+    'openrouter/free',
 ];
-const OPENROUTER_MODELS = (process.env.OPENROUTER_MODELS || DEFAULT_OPENROUTER_MODELS.join(','))
-    .split(',')
-    .map(m => m.trim())
-    .filter(Boolean);
+const configuredOpenRouterModels = String(process.env.OPENROUTER_MODELS || '')
+    .split(',').map(m => m.trim()).filter(Boolean);
+const OPENROUTER_MODELS = [...new Set([...configuredOpenRouterModels, ...DEFAULT_OPENROUTER_MODELS])];
 const AI_CIRCUIT_BREAKER_MS = Number(process.env.AI_CIRCUIT_BREAKER_MS || 5 * 60 * 1000);
 const YOUTUBE_QUERY_LIMIT = Number(process.env.YOUTUBE_QUERY_LIMIT || 36);
 const VIDEO_REFRESH_INTERVAL_MS = Number(process.env.VIDEO_REFRESH_INTERVAL_MS || 10 * 60 * 1000);
 const VIDEO_MAX_AGE_DAYS = Number(process.env.VIDEO_MAX_AGE_DAYS || 7);
+const VIDEO_CACHE_LIMIT = Number(process.env.VIDEO_CACHE_LIMIT || 180);
+const YOUTUBE_API_PAGES = Math.max(1, Math.min(3, Number(process.env.YOUTUBE_API_PAGES || 2)));
+const YOUTUBE_API_QUERY_LIMIT = Math.max(1, Math.min(12, Number(process.env.YOUTUBE_API_QUERY_LIMIT || 6)));
 const JOB_MAX_AGE_DAYS = Number(process.env.JOB_MAX_AGE_DAYS || 30);
 const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 14);
 const VIDEO_DB_RETENTION_HOURS = Number(process.env.VIDEO_DB_RETENTION_HOURS || 72);
 const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
 const OLLAMA_CLOUD_BASE_URL = String(process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com').replace(/\/$/, '');
-const OLLAMA_MODELS = String(process.env.OLLAMA_MODELS || 'qwen3:4b,glm4:9b-chat-q2_K,hf.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF:Q4_K_M,kimi-k2.6:cloud,gemma3:4b,llama3.2:3b,mistral:7b')
+const OLLAMA_MODELS = String(process.env.OLLAMA_MODELS || 'qwen3:4b,glm4:9b-chat-q2_K,gemma4:latest,hf.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF:Q4_K_M,kimi-k2.6:cloud,gemma3:4b,llama3.2:3b,mistral:7b')
     .split(',').map(model => model.trim()).filter(Boolean);
 const HUGGINGFACE_MODELS = String(process.env.HUGGINGFACE_MODELS || 'Qwen/Qwen2.5-7B-Instruct,google/gemma-2-9b-it,mistralai/Mistral-7B-Instruct-v0.3')
     .split(',').map(model => model.trim()).filter(Boolean);
-const AI_MODES = ['auto', 'free', 'ollama', 'ollama-qwen', 'ollama-glm', 'ollama-hf', 'ollama-kimi', 'huggingface', 'openai', 'gemini', 'openrouter', 'offline'];
+const AI_MODES = ['auto', 'free', 'ollama', 'ollama-qwen', 'ollama-glm', 'ollama-gemma', 'ollama-hf', 'ollama-kimi', 'huggingface', 'openai', 'gemini', 'openrouter', 'offline'];
 const MODEL_COOLDOWN_MS = Number(process.env.MODEL_COOLDOWN_MS || 10 * 60 * 1000);
 let aiMode = AI_MODES.includes(String(process.env.AI_MODE || '').toLowerCase())
     ? String(process.env.AI_MODE).toLowerCase()
@@ -110,6 +116,7 @@ function getAIModePayload() {
             { id: 'ollama', label: 'Ollama automatic', available: true, endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS },
             { id: 'ollama-qwen', label: 'Ollama Qwen (local)', available: OLLAMA_MODELS.some(model => /qwen/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /qwen/i.test(model)) },
             { id: 'ollama-glm', label: 'Ollama GLM (local)', available: OLLAMA_MODELS.some(model => /glm/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /glm/i.test(model)) },
+            { id: 'ollama-gemma', label: 'Ollama Gemma 4 (local)', available: OLLAMA_MODELS.some(model => /gemma4/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /gemma4/i.test(model)) },
             { id: 'ollama-hf', label: 'Hugging Face model (local)', available: OLLAMA_MODELS.some(model => /hf\.co|huggingface/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /hf\.co|huggingface/i.test(model)) },
             { id: 'ollama-kimi', label: 'Ollama Kimi (cloud)', available: OLLAMA_MODELS.some(model => /kimi/i.test(model)), endpoint: OLLAMA_BASE_URL, configuredModels: OLLAMA_MODELS.filter(model => /kimi/i.test(model)) },
             { id: 'huggingface', label: 'Hugging Face', available: Boolean(huggingFaceToken), configuredModels: HUGGINGFACE_MODELS },
@@ -507,6 +514,11 @@ function isModelCoolingDown(provider, model) {
     return (modelCooldowns.get(modelHealthKey(provider, model)) || 0) > Date.now();
 }
 
+function modelHardwareIssue(modelName) {
+    if (/gemma4/i.test(modelName) && os.freemem() < 11 * 1024 * 1024 * 1024) return 'insufficient_memory';
+    return null;
+}
+
 function parseJsonFromModel(raw) {
     if (!raw) return null;
     if (typeof raw !== 'string') return raw;
@@ -565,6 +577,8 @@ function summarizeModelError(err) {
     if (responseDetail.includes('subscription')) return 'subscription_required';
     if (responseDetail.includes('rate') || responseDetail.includes('quota')) return 'rate_limited';
     if (responseDetail.includes('not found') || responseDetail.includes('not available')) return 'not_available';
+    if (/insufficient_memory|out of memory|model requires more system memory/i.test(String(err.message || ''))) return 'insufficient_memory';
+    if (/llama-server process has terminated|stack-based buffer/i.test(String(err.message || ''))) return 'runtime_crash';
     if (status) return `HTTP ${status}`;
     if (err.code) return err.code;
     if (err.message?.includes('quota') || err.message?.includes('429')) return 'rate_limited';
@@ -723,6 +737,8 @@ async function getAIInsight(prompt) {
             ? OLLAMA_MODELS.filter(model => /qwen/i.test(model))
             : aiMode === 'ollama-glm'
                 ? OLLAMA_MODELS.filter(model => /glm/i.test(model))
+                : aiMode === 'ollama-gemma'
+                    ? OLLAMA_MODELS.filter(model => /gemma4/i.test(model))
                 : aiMode === 'ollama-hf'
                     ? OLLAMA_MODELS.filter(model => /hf\.co|huggingface/i.test(model))
                 : aiMode === 'ollama-kimi'
@@ -733,6 +749,12 @@ async function getAIInsight(prompt) {
             : preferredOllamaCandidates;
         for (const modelName of ollamaCandidates) {
             if (isModelCoolingDown('Ollama', modelName)) continue;
+            const hardwareIssue = modelHardwareIssue(modelName);
+            if (hardwareIssue) {
+                recordFailure('Ollama', modelName, new Error(hardwareIssue));
+                modelCooldowns.set(modelHealthKey('Ollama', modelName), Date.now() + MODEL_COOLDOWN_MS);
+                continue;
+            }
             try {
                 return recordSuccess('Ollama', modelName, await callOllama(prompt, modelName));
             } catch (error) {
@@ -1102,7 +1124,27 @@ const getScrapedJobs = async (refreshRunId = null, sourceIds = []) => {
     });
 
     const boardJobs = await getBoardSourceJobs(selectedSources.boards);
-    const allRawJobs = [...apiJobs, ...rssJobs, ...boardJobs];
+    const includeLinkedIn = !sourceIds.length || selectedSources.providers.some(provider => provider.label === 'LinkedIn');
+    const linkedInJobs = includeLinkedIn
+        ? await scrapeLinkedInJobsViaGoogle().then(items => items.map(item => ({
+            title: cleanText(item.title || 'LinkedIn role'),
+            company: cleanText(item.company || 'LinkedIn employer'),
+            location: normalizeGeographicLocation(item.location || 'Remote / Global'),
+            url: item.url,
+            isRemote: Boolean(item.isRemote || /remote/i.test(item.location || '')),
+            sourcePublishedAt: toIsoOrNull(item.sourcePublishedAt || item.publishedAt),
+            pay: 'N/A',
+            time: item.time || 'LinkedIn public listing',
+            source: item.source || 'LinkedIn public jobs',
+        }))).catch(error => {
+            recordSourceHealth('linkedin_jobs', 'LinkedIn public jobs', false, 0, summarizeModelError(error));
+            return [];
+        })
+        : [];
+    if (includeLinkedIn) {
+        recordSourceHealth('linkedin_jobs', 'LinkedIn public jobs', linkedInJobs.length > 0, linkedInJobs.length, linkedInJobs.length ? null : 'no_public_jobs_returned');
+    }
+    const allRawJobs = [...apiJobs, ...rssJobs, ...boardJobs, ...linkedInJobs];
 
     // Deduplicate by URL
     const seen = new Set();
@@ -1485,32 +1527,39 @@ function normalizeYouTubeVideo(v, query) {
 async function getYouTubeApiVideos(queries) {
     if (!process.env.YOUTUBE_API_KEY) return [];
     const publishedAfter = new Date(Date.now() - VIDEO_MAX_AGE_DAYS * 24 * 60 * 60 * 1000).toISOString();
-    return fetchBatched(queries.slice(0, Math.min(queries.length, 12)), async (query) => {
+    return fetchBatched(queries.slice(0, Math.min(queries.length, YOUTUBE_API_QUERY_LIMIT)), async (query) => {
         try {
-            const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-                params: {
-                    key: process.env.YOUTUBE_API_KEY,
-                    part: 'snippet',
-                    q: query,
-                    type: 'video',
-                    order: 'date',
-                    publishedAfter,
-                    maxResults: 10,
-                    safeSearch: 'moderate',
-                },
-                timeout: API_TIMEOUT,
-            });
-            const items = (res.data?.items || []).map(item => ({
-                title: cleanText(item.snippet?.title),
-                videoId: item.id?.videoId,
-                channel: item.snippet?.channelTitle || 'YouTube',
-                views: 0,
-                ago: 'recent upload',
-                published: item.snippet?.publishedAt,
-                publishedAt: item.snippet?.publishedAt,
-                publishedAgeDays: Math.max(0, (Date.now() - getTimestamp(item.snippet?.publishedAt)) / 86_400_000),
-                category: /AI|machine|GPT|Gemini/i.test(query) ? 'ai' : 'tech',
-            })).filter(item => item.videoId && item.publishedAt);
+            const items = [];
+            let pageToken;
+            for (let page = 0; page < YOUTUBE_API_PAGES; page += 1) {
+                const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+                    params: {
+                        key: process.env.YOUTUBE_API_KEY,
+                        part: 'snippet',
+                        q: query,
+                        type: 'video',
+                        order: 'date',
+                        publishedAfter,
+                        maxResults: 25,
+                        safeSearch: 'moderate',
+                        ...(pageToken ? { pageToken } : {}),
+                    },
+                    timeout: API_TIMEOUT,
+                });
+                items.push(...(res.data?.items || []).map(item => ({
+                    title: cleanText(item.snippet?.title),
+                    videoId: item.id?.videoId,
+                    channel: item.snippet?.channelTitle || 'YouTube',
+                    views: 0,
+                    ago: 'recent upload',
+                    published: item.snippet?.publishedAt,
+                    publishedAt: item.snippet?.publishedAt,
+                    publishedAgeDays: Math.max(0, (Date.now() - getTimestamp(item.snippet?.publishedAt)) / 86_400_000),
+                    category: /AI|machine|GPT|Gemini/i.test(query) ? 'ai' : 'tech',
+                })).filter(item => item.videoId && item.publishedAt));
+                pageToken = res.data?.nextPageToken;
+                if (!pageToken) break;
+            }
             recordSourceHealth('youtube_api', query, true, items.length);
             return items;
         } catch (error) {
@@ -1545,7 +1594,7 @@ const getYouTubeVideos = async () => {
     const searchVideos = await fetchBatched(allQueries, async (query) => {
         try {
             const r = await withTimeout(ytSearch(query), API_TIMEOUT, { videos: [] });
-            return (r.videos || []).slice(0, 10).map(v => normalizeYouTubeVideo(v, query));
+            return (r.videos || []).slice(0, 20).map(v => normalizeYouTubeVideo(v, query));
         } catch (e) { return []; }
     }, 5); // batch 5 at a time to avoid rate limits
 
@@ -1558,7 +1607,7 @@ const getYouTubeVideos = async () => {
 
     const selectedVideos = videos
         .sort((a, b) => getTimestamp(b.publishedAt) - getTimestamp(a.publishedAt) || ((b.views || 0) - (a.views || 0)))
-        .slice(0, 60);
+        .slice(0, VIDEO_CACHE_LIMIT);
     await saveVideosToNeonDB(selectedVideos);
     console.log(`✅ YouTube: ${selectedVideos.length} fresh videos from ${allQueries.length} queries`);
     return selectedVideos;
@@ -2011,6 +2060,8 @@ let isRefreshing = false;
 let isVideoRefreshing = false;
 let videoRefreshPromise = null;
 let sourceScrapePromise = null;
+let jobRefreshPromise = null;
+let jobRefreshState = { status: 'idle', refreshRunId: null, fetched: 0, startedAt: null, completedAt: null, error: null };
 const REFRESH_RESPONSE_WAIT_MS = Number(process.env.REFRESH_RESPONSE_WAIT_MS || 45000);
 
 function makeRefreshRunId() {
@@ -2042,7 +2093,7 @@ async function refreshVideosIfNeeded(force = false) {
                 return true;
             })
             .sort((a, b) => getTimestamp(b.publishedAt) - getTimestamp(a.publishedAt))
-            .slice(0, 60);
+            .slice(0, VIDEO_CACHE_LIMIT);
         cache.videoLastRefresh = Date.now();
         return cache.videos || [];
     })();
@@ -2057,7 +2108,7 @@ async function refreshVideosIfNeeded(force = false) {
     }
 }
 
-async function refreshAllData() {
+async function refreshAllData({ preloadOnly = false } = {}) {
     if (isRefreshing) return;
     isRefreshing = true;
     cache.lastStarted = Date.now();
@@ -2076,7 +2127,7 @@ async function refreshAllData() {
                 pool.query(`SELECT * FROM news
                     WHERE COALESCE(source_published_at, first_seen_at, created_at) >= NOW() - $1::interval
                     ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC LIMIT 500`, [`${NEWS_MAX_AGE_DAYS} days`]),
-                pool.query('SELECT * FROM youtube_videos WHERE published_at >= NOW() - $1::interval ORDER BY published_at DESC, id DESC LIMIT 60', [`${VIDEO_MAX_AGE_DAYS} days`])
+                pool.query(`SELECT * FROM youtube_videos WHERE published_at >= NOW() - $1::interval ORDER BY published_at DESC, id DESC LIMIT ${VIDEO_CACHE_LIMIT}`, [`${VIDEO_MAX_AGE_DAYS} days`])
             ]);
 
             if (dbJobs.rows.length > 0 || dbNews.rows.length > 0) {
@@ -2088,6 +2139,8 @@ async function refreshAllData() {
                 console.log(`✅ Pre-loaded ${cache.dashboardData.length} items from DB`);
             }
         }
+
+        if (preloadOnly) return;
 
         // Run fresh scraping in parallel
         const scrapeMainData = async () => {
@@ -2181,7 +2234,8 @@ function getDashboardPayload(extra = {}) {
     return {
         data: cache.dashboardData || [],
         trends: cache.trends || [],
-        videos: cache.videos || [],
+        videos: (cache.videos || []).slice(0, 24),
+        videoTotal: (cache.videos || []).length,
         stats: cache.stats || {},
         lastRefresh: cache.lastRefresh,
         health: getServiceHealth(),
@@ -2192,8 +2246,9 @@ function getDashboardPayload(extra = {}) {
 const MODEL_ROUTE_DEFINITIONS = [
     { id: 'ollama-qwen', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /qwen/i.test(item)), name: 'Qwen local', location: 'On this PC', purpose: 'Fast private default' },
     { id: 'ollama-glm', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /glm/i.test(item)), name: 'GLM local', location: 'On this PC', purpose: 'Private reasoning fallback' },
+    { id: 'ollama-gemma', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /gemma4/i.test(item)), name: 'Gemma 4 local', location: 'On this PC', purpose: 'Multimodal open-model reasoning' },
     { id: 'ollama-hf', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /hf\.co|huggingface/i.test(item)), name: 'Hugging Face local', location: 'On this PC', purpose: 'Lightweight private fallback' },
-    { id: 'huggingface', provider: 'Hugging Face', model: () => HUGGINGFACE_MODELS[0], name: 'Hugging Face hosted', location: 'Hosted', purpose: 'Fast open-model fallback' },
+    ...HUGGINGFACE_MODELS.map((modelName, index) => ({ id: index === 0 ? 'huggingface' : `huggingface-${index}`, provider: 'Hugging Face', model: () => modelName, name: `Hugging Face hosted ${index + 1}`, location: 'Hosted', purpose: index === 0 ? 'Fast open-model fallback' : 'Hosted open-model backup' })),
     { id: 'ollama-kimi', provider: 'Ollama', model: () => OLLAMA_MODELS.find(item => /kimi/i.test(item)), name: 'Kimi Cloud', location: 'Hosted', purpose: 'Long-context reasoning' },
     { id: 'openrouter', provider: 'OpenRouter', model: () => OPENROUTER_MODELS[0], name: 'OpenRouter', location: 'Hosted', purpose: 'Multi-model fallback router' },
     { id: 'offline', provider: 'Deterministic', model: () => 'evidence-fallback-v2', name: 'Offline fallback', location: 'On this server', purpose: 'Always-available factual output' },
@@ -2215,8 +2270,10 @@ async function probeModelRoute(definition) {
     try {
         const prompt = 'Return JSON only: {"status":"ready"}';
         let result;
+        const hardwareIssue = definition.id.startsWith('ollama-') ? modelHardwareIssue(model) : null;
+        if (hardwareIssue) throw new Error(hardwareIssue);
         if (definition.id.startsWith('ollama-')) result = await callOllama(prompt, model);
-        else if (definition.id === 'huggingface') result = await callHuggingFace(prompt, model);
+        else if (definition.id.startsWith('huggingface')) result = await callHuggingFace(prompt, model);
         else if (definition.id === 'openrouter') {
             const token = getOpenRouterTokens()[0];
             if (!token) throw new Error('OPENROUTER_API_KEY is not configured');
@@ -2268,13 +2325,14 @@ app.post('/api/ai-modes', (req, res) => {
 });
 
 app.post('/api/model-health-check', async (req, res) => {
-    const routeIds = Array.isArray(req.body?.routeIds) ? req.body.routeIds.slice(0, 8) : [];
+    const routeIds = Array.isArray(req.body?.routeIds) ? req.body.routeIds.slice(0, 12) : [];
     if (!modelProbePromise) {
         modelProbePromise = probeModelRoutes(routeIds).finally(() => { modelProbePromise = null; });
     }
     const results = await modelProbePromise;
     res.json({
         checkedAt: new Date().toISOString(),
+        checked: results.length,
         ready: results.filter(item => item.ok).length,
         unavailable: results.filter(item => !item.ok).length,
         results,
@@ -2290,15 +2348,15 @@ app.get('/api/free-models', async (req, res) => {
             {
                 id: 'ollama',
                 name: 'Ollama',
-                kind: OLLAMA_MODELS.some(id => id.endsWith(':cloud')) ? 'local + cloud' : 'local',
+                kind: OLLAMA_MODELS.some(id => id.endsWith(':cloud')) ? 'hybrid' : 'local',
                 configured: true,
                 reachable: ollama.reachable,
                 endpoint: ollama.endpoint,
                 models: OLLAMA_MODELS.map(id => {
                     const definition = MODEL_ROUTE_DEFINITIONS.find(item => item.model() === id);
-                    const fallbackStatus = id.endsWith(':cloud')
+                    const fallbackStatus = modelHardwareIssue(id) || (id.endsWith(':cloud')
                         ? (process.env.OLLAMA_API_KEY ? 'configured' : 'authorization_required')
-                        : (ollama.installed.includes(id) ? 'installed' : 'not_installed');
+                        : (ollama.installed.includes(id) ? 'installed' : 'not_installed'));
                     return {
                         id,
                         name: definition?.name || id,
@@ -2345,7 +2403,7 @@ app.get('/api/free-models', async (req, res) => {
                 note: huggingFaceToken ? 'Open-source hosted inference is configured.' : 'Set HUGGINGFACE_API_KEY or HF_TOKEN to enable hosted inference.',
             },
         ],
-        routing: ['Qwen local', 'GLM local', 'Hugging Face local', 'Hugging Face hosted', 'Kimi Cloud when entitled', 'OpenRouter free', 'deterministic offline fallback'],
+        routing: ['Qwen local', 'GLM local', 'Gemma 4 when memory allows', 'Hugging Face local', 'Hugging Face hosted', 'Kimi Cloud when entitled', 'OpenRouter free reasoning pool', 'deterministic offline fallback'],
         lastRuntime: getAIModePayload().runtime,
         dailyNewsUpdate: bridge,
     });
@@ -2356,8 +2414,8 @@ app.get('/api/integrations', async (req, res) => {
     res.json({
         dailyNewsUpdate: bridge,
         linkedin: {
-            connected: bridge.connected && bridge.linkedInImports > 0,
-            items: bridge.linkedInImports || 0,
+            connected: Boolean((bridge.connected && bridge.linkedInImports > 0) || getLinkedInProxyStatus().available),
+            items: Math.max(bridge.linkedInImports || 0, getLinkedInProxyStatus().items || 0),
             mode: 'rss_proxy_and_import',
             requiredPath: 'smart_job_portal/daily_news_updater/data/imports/linkedin.json',
             proxy: getLinkedInProxyStatus(),
@@ -2373,7 +2431,7 @@ app.get('/api/integrations', async (req, res) => {
 app.post('/api/linkedin-feed-import', async (req, res) => {
     const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 200) : [];
     if (!items.length) return res.status(400).json({ error: 'items_required', format: [{ title: '...', url: '...', author: '...', summary: '...', publishedAt: '...' }] });
-    const root = path.resolve(__dirname, '../smart_job_portal/daily_news_updater');
+    const root = path.resolve(process.env.DAILY_NEWS_UPDATER_PATH || path.resolve(__dirname, '../../smart_job_portal/daily_news_updater'));
     const importPath = path.join(root, 'data/imports/linkedin.json');
     try {
         await require('fs/promises').mkdir(path.dirname(importPath), { recursive: true });
@@ -2497,6 +2555,49 @@ app.post('/api/refresh', async (req, res) => {
     }));
 });
 
+app.post('/api/jobs/refresh', async (req, res) => {
+    const requestedSourceIds = [...new Set(Array.isArray(req.body?.sourceIds) ? req.body.sourceIds.map(String) : [])].slice(0, 12);
+    const sourceIds = requestedSourceIds.length
+        ? requestedSourceIds
+        : getJobSourceCatalog().filter(provider => provider.featured).slice(0, 12).map(provider => provider.id);
+    if (!jobRefreshPromise) {
+        const refreshRunId = makeRefreshRunId();
+        jobRefreshState = {
+            status: 'running', refreshRunId, fetched: 0,
+            startedAt: new Date().toISOString(), completedAt: null, error: null,
+        };
+        jobRefreshPromise = (async () => {
+            const jobs = await getScrapedJobs(refreshRunId, sourceIds);
+            const news = (cache.dashboardData || []).filter(item => item.type !== 'job');
+            cache.dashboardData = [...jobs, ...news].sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0));
+            cache.lastRefresh = Date.now();
+            cache.lastRefreshRunId = refreshRunId;
+            cache.stats = {
+                ...cache.stats,
+                totalJobs: jobs.length,
+                lastRefreshISO: new Date(cache.lastRefresh).toISOString(),
+                refreshRunId,
+            };
+            jobRefreshState = {
+                ...jobRefreshState,
+                status: 'completed', fetched: jobs.length, completedAt: new Date().toISOString(),
+            };
+            return { jobs, refreshRunId };
+        })().catch(error => {
+            jobRefreshState = {
+                ...jobRefreshState,
+                status: 'failed', error: summarizeModelError(error), completedAt: new Date().toISOString(),
+            };
+            throw error;
+        }).finally(() => { jobRefreshPromise = null; });
+    }
+    res.status(202).json({ ...jobRefreshState, health: getServiceHealth() });
+});
+
+app.get('/api/jobs/refresh-status', (req, res) => {
+    res.json({ ...jobRefreshState, health: getServiceHealth() });
+});
+
 app.get('/api/dashboard-data', async (req, res) => {
     const forceFresh = req.query.fresh === '1' || req.query.refresh === '1' || req.query.fresh === 'true';
     if (!forceFresh && cache.dashboardData) return res.json({ data: cache.dashboardData, lastRefresh: cache.lastRefresh, stats: cache.stats, health: getServiceHealth() });
@@ -2541,8 +2642,16 @@ app.get('/api/latest-trends', async (req, res) => {
 app.get('/api/videos', async (req, res) => {
     const force = req.query.refresh === '1' || req.query.refresh === 'true';
     const videos = await refreshVideosIfNeeded(force);
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.max(6, Math.min(48, Number(req.query.limit || 24)));
+    const offset = (page - 1) * limit;
     res.json({
-        videos,
+        videos: videos.slice(offset, offset + limit),
+        total: videos.length,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(videos.length / limit)),
+        hasNextPage: offset + limit < videos.length,
         lastRefresh: cache.videoLastRefresh,
         lastRefreshISO: cache.videoLastRefresh ? new Date(cache.videoLastRefresh).toISOString() : null,
         isRefreshing: isVideoRefreshing,
@@ -2558,7 +2667,7 @@ app.get('/api/ai-insights', async (req, res) => {
         const totalJobs = (cache.dashboardData || []).filter(d => d.type === 'job').length;
 
         if (newsSlice.length === 0 || jobsSlice.length === 0) {
-            return res.json({ summary_news: "Initializing Live Intelligence.", summary_jobs: "Starting Global Scan.", videos });
+            return res.json({ summary_news: "Initializing Live Intelligence.", summary_jobs: "Starting Global Scan.", videos: videos.slice(0, 24) });
         }
 
         const prompt = `You are a Silicon Valley Intelligence Analyst. Analyze:
@@ -2569,7 +2678,7 @@ Return JSON: {"summary_news":"...","summary_jobs":"..."}`;
 
         const aiJson = await getAIInsight(prompt);
         if (aiJson) {
-            aiJson.videos = videos;
+            aiJson.videos = videos.slice(0, 24);
             aiJson.provider = aiRuntime.lastProvider;
             aiJson.model = aiRuntime.lastModel;
             aiJson.fallback = false;
@@ -2578,7 +2687,7 @@ Return JSON: {"summary_news":"...","summary_jobs":"..."}`;
         res.json({
             summary_news: `Live data active across ${totalNews} news signals.`,
             summary_jobs: `${totalJobs} tracked roles are currently active.`,
-            videos,
+            videos: videos.slice(0, 24),
             provider: 'Deterministic',
             model: 'offline-summary',
             fallback: true,
@@ -2587,7 +2696,7 @@ Return JSON: {"summary_news":"...","summary_jobs":"..."}`;
         res.json({
             summary_news: "AI Unavailable. Live Streams Active.",
             summary_jobs: "Global Hiring Active.",
-            videos,
+            videos: videos.slice(0, 24),
             provider: 'Deterministic',
             model: 'offline-summary',
             fallback: true,
@@ -2671,6 +2780,7 @@ app.get('/api/portal-jobs', async (req, res) => {
     if (status && status !== 'all') {
         if (normalizeJobStatus(status) === 'open') {
             conditions.push(`LOWER(COALESCE(status, 'open')) IN ('open', 'new', 'queued')`);
+            conditions.push(`COALESCE(last_seen_at, refreshed_at, first_seen_at, created_at) >= NOW() - INTERVAL '14 days'`);
         } else {
             conditions.push(`LOWER(COALESCE(status, 'open')) = $${paramCount}`);
             params.push(normalizeJobStatus(status));
@@ -2687,7 +2797,7 @@ app.get('/api/portal-jobs', async (req, res) => {
         const jobsRes = await pool.query(
             `SELECT id, ${SQL_CLEAN('title')} AS title, ${SQL_CLEAN('company')} AS company, url, source, ${SQL_CLEAN('location')} AS location, pay, posted_date, source_published_at, first_seen_at, last_seen_at, status, notes, match_score, applied_at, follow_up_at, archived_at, refreshed_at, refresh_run_id
              FROM jobs ${whereClause}
-             ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC
+             ORDER BY COALESCE(source_published_at, refreshed_at, last_seen_at, first_seen_at, created_at) DESC, id DESC
              LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
             [...params, parseInt(limit), offset]
         );
@@ -3008,7 +3118,10 @@ app.listen(PORT, async () => {
     console.log(`📰 News Sources: ${NEWS_RSS_FEEDS.length} RSS + ${HN_QUERIES.length} HN queries = ${NEWS_RSS_FEEDS.length + HN_QUERIES.length} total`);
     await ensureDBTables();
     await cleanupKnownJobNoise();
-    refreshAllData(); // Trigger immediately on start
+    await refreshAllData({ preloadOnly: true });
+    setTimeout(() => {
+        if (!jobRefreshPromise) refreshAllData();
+    }, 2 * 60 * 1000);
     setInterval(() => refreshAllData(), REFRESH_INTERVAL);
     setInterval(() => pruneDatabase(), DB_PURGE_INTERVAL);
     console.log(`⏱️  Auto-refresh: every 10 min | DB purge: every 3 hours`);

@@ -24,6 +24,12 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: HUGGINGFACE_API_KEY
+        sync: false
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: OLLAMA_CLOUD_BASE_URL
+        value: https://ollama.com
       - key: Gemma4_26b_token
         sync: false
       - key: Gemma4_31b_token
