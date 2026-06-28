@@ -1,0 +1,6 @@
+{
+  "feeds": [],
+  "mediumFeeds": [],
+  "googleNewsQueries": ["technology news", "AI artificial intelligence", "startup funding", "software engineering"],
+  "arxivQueries": ["cs.AI", "cs.LG"]
+}

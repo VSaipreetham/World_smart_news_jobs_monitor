@@ -30,6 +30,9 @@ import {
   Video,
   Zap,
   X,
+  Bell,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import './App.css';
 
@@ -156,8 +159,50 @@ function AiBadge({ meta, label = 'AI' }) {
   );
 }
 
+
+const TOAST_DURATION = 4000;
+let toastId = 0;
+
+function ToastContainer({ toasts, onDismiss }) {
+  return (
+    <div className="toast-container" aria-live="polite">
+      {toasts.map((t) => (
+        <div key={t.id} className={`toast toast-${t.type}`} role="alert">
+          <span>{t.message}</span>
+          <button onClick={() => onDismiss(t.id)} aria-label="Dismiss">×</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const globeRef = useRef(null);
+
+  const [toasts, setToasts] = useState([]);
+  const addToast = useCallback((message, type = 'info') => {
+    const id = ++toastId;
+    setToasts((prev) => [...prev.slice(-4), { id, message, type }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), TOAST_DURATION);
+  }, []);
+
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem('theme');
+    if (saved) return saved === 'dark';
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+    localStorage.setItem('theme', darkMode ? 'dark' : 'light');
+  }, [darkMode]);
+
+  const [lastSeenCount, setLastSeenCount] = useState(() => Number(localStorage.getItem('lastSeenJobCount') || 0));
+  const [bellOpen, setBellOpen] = useState(false);
+  
+  const searchTimerRef = useRef(null);
+  const notesTimerRef = useRef(null);
+
   const [data, setData] = useState([]);
   const [trends, setTrends] = useState([]);
   const [videos, setVideos] = useState([]);
@@ -377,6 +422,7 @@ export default function App() {
       });
       const json = await res.json();
       setSourceScrapeResult(json);
+      addToast('Sources scraped successfully', 'success');
       if (res.ok) {
         await Promise.all([fetchDashboard(), fetchPortalJobs(1, '', portalStatus), fetchPortalAnalytics(), fetchOperationalConfig()]);
       }
@@ -435,6 +481,7 @@ export default function App() {
     if (res.ok) {
       setPortalJobs((items) => items.filter((item) => item.id !== job.id));
       setSelectedPortalJob(null);
+      addToast('Job removed', 'success');
       fetchPortalAnalytics();
     }
   };
@@ -709,6 +756,31 @@ export default function App() {
     ? 'cooldown'
     : (health?.ai?.model || stats.modelName || 'fallback');
 
+  
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === 'Escape') {
+        setSelectedPoint(null);
+        if (portalOpen) setPortalOpen(false);
+        setBellOpen(false);
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        document.querySelector('.search-box input')?.focus();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'p') {
+        e.preventDefault();
+        openPortal();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'r' && !e.shiftKey) {
+        e.preventDefault();
+        forceRefresh();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [portalOpen, forceRefresh, openPortal]);
+
   useEffect(() => {
     if (!globeRef.current) return;
     const controls = globeRef.current.controls();
@@ -731,7 +803,7 @@ export default function App() {
   }, [portalTab, portalOpen]);
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-theme={darkMode ? "dark" : "light"}>
       <header className="topbar">
         <div className="brand-lockup">
           <Globe2 size={26} />
@@ -745,7 +817,30 @@ export default function App() {
           <button onClick={async () => { await openPortal(); setPortalTab('models'); }}><Cpu size={15} /> Free models</button>
           <button onClick={openPortal}><Briefcase size={15} /> Career desk</button>
         </nav>
+        
         <div className="topbar-actions">
+          <div className="bell-wrapper">
+            <button className="icon-button" onClick={() => { setBellOpen((o) => !o); setLastSeenCount(jobs.length); localStorage.setItem('lastSeenJobCount', String(jobs.length)); }} title="Notifications">
+              <Bell size={18} />
+              {Math.max(0, jobs.length - lastSeenCount) > 0 && <span className="bell-badge">{Math.max(0, jobs.length - lastSeenCount) > 99 ? '99+' : Math.max(0, jobs.length - lastSeenCount)}</span>}
+            </button>
+            {bellOpen && (
+              <div className="bell-dropdown">
+                <h4>Recent Jobs ({Math.max(0, jobs.length - lastSeenCount)} new)</h4>
+                {jobs.slice(0, 8).map((job, i) => (
+                  <a key={job.id || i} href={job.url} target="_blank" rel="noreferrer" className="bell-item">
+                    <strong>{job.title}</strong>
+                    <span>{job.company} — {job.location}</span>
+                  </a>
+                ))}
+                {jobs.length === 0 && <p className="bell-empty">No jobs yet</p>}
+              </div>
+            )}
+          </div>
+          <button className="icon-button" onClick={() => setDarkMode((d) => !d)} title={darkMode ? 'Light mode' : 'Dark mode'}>
+            {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+          </button>
+
           <span className={`status-pill ${freshTone}`}>
             <Activity size={15} />
             {health?.isRefreshing ? 'Refreshing' : health?.lastError ? 'Degraded' : 'Live'}
@@ -1035,7 +1130,7 @@ export default function App() {
             </div>
             <div className="video-list">
               {(isLoading || isRefreshing) && videos.length === 0 && <SkeletonRows count={4} media />}
-              {videos.slice(0, 8).map((video) => (
+              {videos.slice(0, 24).map((video) => (
                 <a className="video-row" href={`https://www.youtube.com/watch?v=${video.videoId}`} target="_blank" rel="noreferrer" key={video.videoId}>
                   <img src={`https://img.youtube.com/vi/${video.videoId}/mqdefault.jpg`} alt="" loading="lazy" />
                   <span>
@@ -1135,7 +1230,11 @@ export default function App() {
                 <Search size={16} />
                 <input
                   value={portalQuery}
-                  onChange={(event) => setPortalQuery(event.target.value)}
+                  onChange={(event) => {
+    setPortalQuery(event.target.value);
+    clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => fetchPortalJobs(1, event.target.value, portalStatus), 400);
+  }}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter') fetchPortalJobs(1, portalQuery, portalStatus);
                   }}
@@ -1182,7 +1281,14 @@ export default function App() {
                       <textarea
                         className="notes-box"
                         value={selectedPortalJob.notes || ''}
-                        onChange={(event) => setSelectedPortalJob({ ...selectedPortalJob, notes: event.target.value })}
+                        onChange={(event) => {
+    const value = event.target.value;
+    setSelectedPortalJob({ ...selectedPortalJob, notes: value });
+    clearTimeout(notesTimerRef.current);
+    notesTimerRef.current = setTimeout(() => {
+      if (selectedPortalJob) updatePortalJob(selectedPortalJob, { notes: value });
+    }, 1500);
+  }}
                         placeholder="Notes, recruiter names, follow-up plan..."
                       />
                       <div className="job-actions">
@@ -1453,6 +1559,7 @@ export default function App() {
           </div>
         </div>
       )}
+      <ToastContainer toasts={toasts} onDismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))} />
     </div>
   );
 }

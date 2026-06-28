@@ -26,6 +26,18 @@ const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const { JOB_APIS, JOB_RSS_FEEDS, JOB_BOARD_SOURCES, NEWS_RSS_FEEDS, HN_QUERIES } = require('./sources');
 const { getDailyNewsSources, getLinkedInImports, getDailyNewsBridgeStatus } = require('./dailyNewsBridge');
+const { scrapeLinkedInJobsViaGoogle, scrapeLinkedInArticlesViaGoogle, getLinkedInProxyStatus } = require('./linkedinScraper');
+
+async function withRetry(fn, retries = 2, delayMs = 1000) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            if (attempt === retries) throw error;
+            await new Promise(resolve => setTimeout(resolve, delayMs * Math.pow(2, attempt)));
+        }
+    }
+}
 
 const app = express();
 app.use(cors());
@@ -1190,7 +1202,17 @@ const getScrapedNews = async (refreshRunId = null) => {
         return [];
     });
     recordSourceHealth('linkedin', 'DailyNewsUpdate import', linkedInNews.length > 0, linkedInNews.length, linkedInNews.length ? null : 'authorization_or_import_required');
-    const allRawNews = [...hnNews, ...rssNews, ...linkedInNews];
+
+    // Also try LinkedIn proxy scraper
+    const linkedInProxy = await scrapeLinkedInArticlesViaGoogle().catch(error => {
+        recordSourceHealth('linkedin_proxy', 'Google RSS proxy', false, 0, error.message);
+        return [];
+    });
+    if (linkedInProxy.length) {
+        recordSourceHealth('linkedin_proxy', 'Google RSS proxy', true, linkedInProxy.length);
+    }
+
+    const allRawNews = [...hnNews, ...rssNews, ...linkedInNews, ...linkedInProxy];
     const candidateNews = allRawNews.filter(n => isRecentDate(n.date));
     const seen = new Set();
     const uniqueNews = sortByDateDesc(candidateNews).filter(n => {
@@ -2336,8 +2358,9 @@ app.get('/api/integrations', async (req, res) => {
         linkedin: {
             connected: bridge.connected && bridge.linkedInImports > 0,
             items: bridge.linkedInImports || 0,
-            mode: 'authorized_feed_or_import',
+            mode: 'rss_proxy_and_import',
             requiredPath: 'smart_job_portal/daily_news_updater/data/imports/linkedin.json',
+            proxy: getLinkedInProxyStatus(),
         },
         youtube: {
             apiConfigured: Boolean(process.env.YOUTUBE_API_KEY),
@@ -2345,6 +2368,39 @@ app.get('/api/integrations', async (req, res) => {
             maxAgeDays: VIDEO_MAX_AGE_DAYS,
         },
     });
+});
+
+app.post('/api/linkedin-feed-import', async (req, res) => {
+    const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 200) : [];
+    if (!items.length) return res.status(400).json({ error: 'items_required', format: [{ title: '...', url: '...', author: '...', summary: '...', publishedAt: '...' }] });
+    const root = path.resolve(__dirname, '../smart_job_portal/daily_news_updater');
+    const importPath = path.join(root, 'data/imports/linkedin.json');
+    try {
+        await require('fs/promises').mkdir(path.dirname(importPath), { recursive: true });
+        const existing = await require('fs/promises').readFile(importPath, 'utf8').then(JSON.parse).catch(() => []);
+        const seen = new Set(existing.map(item => item.url));
+        const newItems = items.filter(item => item.url && !seen.has(item.url));
+        const merged = [...existing, ...newItems].slice(-500);
+        await require('fs/promises').writeFile(importPath, JSON.stringify(merged, null, 2));
+        res.json({ imported: newItems.length, total: merged.length });
+    } catch (e) {
+        console.error('LinkedIn import error:', e.message);
+        res.status(500).json({ error: 'import_failed' });
+    }
+});
+
+app.get('/api/linkedin-proxy-status', async (req, res) => {
+    try {
+        const status = getLinkedInProxyStatus();
+        const bridge = await getDailyNewsBridgeStatus();
+        res.json({
+            proxy: status,
+            bridge: { connected: bridge.connected, linkedInImports: bridge.linkedInImports || 0 },
+            combined: { totalItems: (status.items || 0) + (bridge.linkedInImports || 0), available: status.available || bridge.connected },
+        });
+    } catch (e) {
+        res.json({ proxy: { available: false }, bridge: { connected: false }, error: e.message });
+    }
 });
 
 app.get('/api/source-health', (req, res) => {
@@ -2929,6 +2985,22 @@ app.get('/api/stats', (req, res) => res.json({ ...cache.stats, health: getServic
 // ═══════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════
+app.use((err, req, res, next) => {
+    console.error(`❌ Unhandled error on ${req.method} ${req.path}:`, err.message);
+    res.status(500).json({ error: 'internal_server_error', message: err.message });
+});
+
+function gracefulShutdown(signal) {
+    console.log(`\n⚠️ ${signal} received. Shutting down gracefully...`);
+    if (typeof pool !== 'undefined' && pool) pool.end().catch(() => {});
+    process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+    console.error('❌ Unhandled rejection:', reason?.message || reason);
+});
+
 const PORT = Number(process.env.PORT || 8000);
 app.listen(PORT, async () => {
     console.log(`\n🚀 Smart News & Job Tracker Backend on port ${PORT}`);

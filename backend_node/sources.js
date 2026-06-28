@@ -397,7 +397,8 @@ const HN_QUERIES = [
 const JOB_BOARD_SOURCES = [
     { name: "Y Combinator", host: "ycombinator.com", url: "https://www.ycombinator.com/jobs", region: "Startup / Global" },
     { name: "Naukri", host: "naukri.com", url: "https://www.naukri.com/software-developer-jobs", region: "India" },
-    { name: "LinkedIn", host: "linkedin.com", url: "https://www.linkedin.com/jobs/search/?keywords=software%20engineer&location=India", region: "Global" },
+    // Note: LinkedIn actively blocks direct scraping. The backend uses Google RSS proxy as a fallback.
+    { name: "LinkedIn", host: "linkedin.com", url: "https://www.linkedin.com/jobs/search/?keywords=software%20engineer&f_TPR=r86400&position=1&pageNum=0", region: "Global" },
     { name: "Indeed India", host: "indeed.com", url: "https://in.indeed.com/jobs?q=software+engineer&l=India", region: "India" },
     { name: "Foundit", host: "foundit.in", url: "https://www.foundit.in/srp/results?query=software%20engineer", region: "India" },
     { name: "Shine", host: "shine.com", url: "https://www.shine.com/job-search/software-developer-jobs", region: "India" },
