@@ -295,6 +295,7 @@ export default function App() {
   const [aiMode, setAiMode] = useState('auto');
   const [aiModes, setAiModes] = useState([]);
   const [sourceRegistry, setSourceRegistry] = useState(null);
+  const [automationSummary, setAutomationSummary] = useState(null);
   const [freeModels, setFreeModels] = useState(null);
   const [integrations, setIntegrations] = useState(null);
   const [sourceHealth, setSourceHealth] = useState(null);
@@ -310,12 +311,13 @@ export default function App() {
   const [copiedModel, setCopiedModel] = useState('');
 
   const fetchOperationalConfig = useCallback(async () => {
-    const [modesRes, sourcesRes, modelsRes, integrationsRes, healthRes] = await Promise.allSettled([
+    const [modesRes, sourcesRes, modelsRes, integrationsRes, healthRes, automationRes] = await Promise.allSettled([
       apiFetch('/api/ai-modes'),
       apiFetch('/api/source-registry'),
       apiFetch('/api/free-models'),
       apiFetch('/api/integrations'),
       apiFetch('/api/source-health'),
+      apiFetch('/api/automation/summary'),
     ]);
     if (modesRes.status === 'fulfilled' && modesRes.value.ok) {
       const json = await modesRes.value.json();
@@ -330,6 +332,7 @@ export default function App() {
     if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) setFreeModels(await modelsRes.value.json());
     if (integrationsRes.status === 'fulfilled' && integrationsRes.value.ok) setIntegrations(await integrationsRes.value.json());
     if (healthRes.status === 'fulfilled' && healthRes.value.ok) setSourceHealth(await healthRes.value.json());
+    if (automationRes.status === 'fulfilled' && automationRes.value.ok) setAutomationSummary(await automationRes.value.json());
   }, []);
 
   const fetchVideoPage = useCallback(async (page = 1, refresh = false) => {
@@ -512,8 +515,20 @@ export default function App() {
         body: JSON.stringify({}),
       });
       const json = await res.json();
+      if (!res.ok) {
+        const error = res.status === 401
+          ? 'Connect the owner key in Career workspace before testing model routes.'
+          : json.error || `Model test failed (${res.status}).`;
+        setModelProbeResult({ checked: 0, ready: 0, unavailable: 0, error });
+        addToast(error, 'error');
+        return;
+      }
       setModelProbeResult(json);
       await fetchOperationalConfig();
+    } catch {
+      const message = 'Could not reach the model test service. Check the backend connection and try again.';
+      setModelProbeResult({ checked: 0, ready: 0, unavailable: 0, error: message });
+      addToast(message, 'error');
     } finally {
       setPortalBusy(false);
       setBusyLabel('');
@@ -1335,9 +1350,15 @@ export default function App() {
             <div className="workspace-header">
               <div>
                 <h2>{portalTab === 'models' ? <><Cpu size={20} /> AI Runtime Console</> : <><Briefcase size={20} /> Career Operations Desk</>}</h2>
-                <p>{portalTab === 'models' ? 'Private local reasoning with measured hosted fallbacks' : `${sourceRegistry?.counts?.boards || 0} boards, ${sourceRegistry?.counts?.apis || 0} APIs, ${sourceRegistry?.counts?.rss || 0} feeds`}</p>
+                <p>{portalTab === 'models'
+                  ? 'Private local reasoning with measured hosted fallbacks'
+                  : (automationSummary?.ownerConfigured === false
+                    ? `${automationSummary.counts?.portals || 0} career portals listed · ${automationSummary.counts?.activeSources || 0} sources enabled`
+                    : `${sourceRegistry?.counts?.boards || 0} boards, ${sourceRegistry?.counts?.apis || 0} APIs, ${sourceRegistry?.counts?.rss || 0} feeds`)}</p>
               </div>
-              <span>{portalTab === 'models' ? `${modelProbeResult?.ready || 0} engines ready` : `${portalTotal || portalAnalytics?.totals?.jobs || 0} roles`}</span>
+              <span>{portalTab === 'models'
+                ? (modelProbeResult ? `${modelProbeResult.ready || 0} engines ready` : `${freeModels?.providers?.filter((provider) => provider.configured && provider.reachable).length || 0} hosted providers reachable`)
+                : (automationSummary?.ownerConfigured === false ? 'Private access setup required' : `${portalTotal || portalAnalytics?.totals?.jobs || 0} roles`)}</span>
             </div>
             {portalTab === 'models' ? (
               <div className="model-console-banner">
@@ -1364,6 +1385,13 @@ export default function App() {
                   <RefreshCcw size={16} /> {isRefreshing ? 'Fetching jobs' : 'Refresh current jobs'}
                 </button>
               </div>
+            )}
+            {portalTab !== 'models' && automationSummary?.ownerConfigured === false && (
+              <section className="career-access-notice" role="status">
+                <div><ShieldCheck size={18} /><strong>Finish private workspace setup</strong></div>
+                <p>The backend is online, but its owner access key is not configured. Career jobs, profile data, source refresh, and model tests stay locked until <code>PORTAL_ADMIN_TOKEN</code> is set as a private backend environment variable.</p>
+                <a href="?workspace=jobs">Open Career workspace to connect the key <ArrowUpRight size={14} /></a>
+              </section>
             )}
             {portalTab !== 'models' && <section className="career-workflow" aria-label="Career desk workflow">
               <div className="career-workflow-copy"><span className="section-kicker"><Workflow size={14} /> Career workflow</span><strong>Discover → verify → match → prepare → review</strong><small>Search and preparation can run automatically. Application emails and final submissions stay approval gated.</small></div>
@@ -1584,9 +1612,13 @@ export default function App() {
                       </select>
                     </label>
                     <button onClick={() => { setPortalBusy(true); setBusyLabel('Refreshing model catalog'); void fetchOperationalConfig().finally(() => { setPortalBusy(false); setBusyLabel(''); }); }} disabled={portalBusy}><RefreshCcw size={15} /> Refresh catalog</button>
-                    <button onClick={runModelHealthCheck} disabled={portalBusy}><Activity size={15} /> Test engines</button>
+                    <button onClick={runModelHealthCheck} disabled={portalBusy || automationSummary?.ownerConfigured === false} title={automationSummary?.ownerConfigured === false ? 'Configure backend owner access and connect the Career workspace to test models.' : 'Send a small test prompt to configured model routes.'}><Activity size={15} /> Test engines</button>
                   </div>
                 </div>
+
+                {automationSummary?.ownerConfigured === false && (
+                  <div className="model-access-note" role="status">OpenRouter is configured and reachable. A response test uses private backend credentials, so it stays locked until owner access is configured. <a href="?workspace=jobs">Connect Career workspace <ArrowUpRight size={13} /></a></div>
+                )}
 
                 <div className="model-catalog-controls">
                   <label className="search-box"><Search size={15} /><input aria-label="Search free model catalog" placeholder="Search models by name or purpose" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} /></label>
@@ -1599,6 +1631,7 @@ export default function App() {
                     <strong>{modelProbeResult.ready || 0} ready</strong>
                     <span>{modelProbeResult.unavailable || 0} unavailable</span>
                     <small>Checked {modelProbeResult.checked || 0} response routes</small>
+                    {modelProbeResult.error && <small role="alert">{modelProbeResult.error}</small>}
                   </div>
                 )}
 
