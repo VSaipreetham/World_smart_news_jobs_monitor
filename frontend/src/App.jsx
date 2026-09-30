@@ -176,6 +176,25 @@ function modelStatusLabel(status) {
   return labels[status] || 'Needs attention';
 }
 
+class GlobeErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error) {
+    console.warn('Interactive globe unavailable; keeping monitor controls active.', error?.message || error);
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
 function AiBadge({ meta, label = 'AI' }) {
   const provider = meta?.provider || 'Deterministic';
   const model = cleanModelLabel(meta?.model || meta?.modelName);
@@ -983,47 +1002,49 @@ export default function App() {
             {isLoading ? (
               <div className="loader"><RefreshCcw className="spin" size={28} /> Connecting live feeds</div>
             ) : (
-              <React.Suspense fallback={<div className="loader"><RefreshCcw className="spin" size={24} /> Loading interactive map</div>}>
-                <Globe
-                  ref={globeRef}
-                  globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
-                  backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
-                  pointsData={globeMode === 'news' ? [] : globeJobs}
-                  pointLat="lat"
-                  pointLng="lng"
-                  pointColor={() => '#15b86a'}
-                  pointRadius={(d) => d.size || 0.36}
-                  pointAltitude={0.01}
-                  pointLabel={(d) => `${escapeTooltip(d.title || 'Role')}<br/>${escapeTooltip(d.company || 'Company')} - ${escapeTooltip(d.location || 'Location unavailable')}`}
-                  ringsData={globeMode === 'jobs' ? [] : globeNews}
-                  ringLat="lat"
-                  ringLng="lng"
-                  ringColor={() => '#ef4444'}
-                  ringMaxRadius={(d) => d.radius || 3.6}
-                  ringPropagationSpeed={0.55}
-                  ringRepeatPeriod={900}
-                  arcsData={globeMode === 'opportunity' ? opportunityArcs : []}
-                  arcStartLat="startLat"
-                  arcStartLng="startLng"
-                  arcEndLat="endLat"
-                  arcEndLng="endLng"
-                  arcColor={() => ['rgba(239,68,68,0.18)', 'rgba(21,184,106,0.92)']}
-                  arcAltitude={0.18}
-                  arcStroke={0.45}
-                  arcDashLength={0.36}
-                  arcDashGap={1.1}
-                  arcDashAnimateTime={2600}
-                  labelsData={globeClusters}
-                  labelLat="lat"
-                  labelLng="lng"
-                  labelText="label"
-                  labelColor={() => '#ffffff'}
-                  labelSize={(d) => Math.min(1.45, 0.72 + d.count * 0.05)}
-                  labelDotRadius={(d) => Math.min(0.7, 0.18 + d.count * 0.025)}
-                  labelAltitude={0.025}
-                  onPointClick={setSelectedPoint}
-                />
-              </React.Suspense>
+              <GlobeErrorBoundary fallback={<div className="globe-fallback"><div><span><Globe2 size={18} /> LIVE SIGNAL MAP</span><h2>Signals stay live without the 3D map</h2><p>This browser cannot start WebGL. News, job feeds, search, and Career Desk are still available below.</p><strong>{worldCommand.totals.jobs} jobs · {worldCommand.totals.news} news · {globeClusters.length} active regions</strong></div><div className="globe-fallback-regions">{globeClusters.slice(0, 6).map((cluster) => <button key={cluster.label} onClick={() => { setQuery(cluster.label); window.scrollTo({ top: 0, behavior: 'smooth' }); }}><span>{cluster.label}</span><small>{cluster.jobs} jobs · {cluster.news} news</small><ArrowUpRight size={14} /></button>)}</div></div>}>
+                <React.Suspense fallback={<div className="loader"><RefreshCcw className="spin" size={24} /> Loading interactive map</div>}>
+                  <Globe
+                    ref={globeRef}
+                    globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
+                    backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
+                    pointsData={globeMode === 'news' ? [] : globeJobs}
+                    pointLat="lat"
+                    pointLng="lng"
+                    pointColor={() => '#15b86a'}
+                    pointRadius={(d) => d.size || 0.36}
+                    pointAltitude={0.01}
+                    pointLabel={(d) => `${escapeTooltip(d.title || 'Role')}<br/>${escapeTooltip(d.company || 'Company')} - ${escapeTooltip(d.location || 'Location unavailable')}`}
+                    ringsData={globeMode === 'jobs' ? [] : globeNews}
+                    ringLat="lat"
+                    ringLng="lng"
+                    ringColor={() => '#ef4444'}
+                    ringMaxRadius={(d) => d.radius || 3.6}
+                    ringPropagationSpeed={0.55}
+                    ringRepeatPeriod={900}
+                    arcsData={globeMode === 'opportunity' ? opportunityArcs : []}
+                    arcStartLat="startLat"
+                    arcStartLng="startLng"
+                    arcEndLat="endLat"
+                    arcEndLng="endLng"
+                    arcColor={() => ['rgba(239,68,68,0.18)', 'rgba(21,184,106,0.92)']}
+                    arcAltitude={0.18}
+                    arcStroke={0.45}
+                    arcDashLength={0.36}
+                    arcDashGap={1.1}
+                    arcDashAnimateTime={2600}
+                    labelsData={globeClusters}
+                    labelLat="lat"
+                    labelLng="lng"
+                    labelText="label"
+                    labelColor={() => '#ffffff'}
+                    labelSize={(d) => Math.min(1.45, 0.72 + d.count * 0.05)}
+                    labelDotRadius={(d) => Math.min(0.7, 0.18 + d.count * 0.025)}
+                    labelAltitude={0.025}
+                    onPointClick={setSelectedPoint}
+                  />
+                </React.Suspense>
+              </GlobeErrorBoundary>
             )}
             {!isLoading && (
               <div className="globe-intel">
