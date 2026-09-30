@@ -1,3 +1,8 @@
+from dotenv import load_dotenv
+
+# Model imports establish the database connection, so load configuration first.
+load_dotenv()
+
 import streamlit as st
 import pandas as pd
 from models import Session, Job, JobStatus, engine
@@ -5,18 +10,13 @@ from sqlalchemy import func
 from scraper import scrape_jobs
 from data_export import export_jobs_to_excel
 from scheduler_service import start_scheduler
-from notifications import send_email_notification
+from notifications import build_email_preview, send_email_notification
 from calendar_integration import create_calendar_note
 
 import os
 import datetime
 import requests
 import time
-from dotenv import load_dotenv
-
-load_dotenv() # Load environment variables
-
-
 # Page Config
 st.set_page_config(page_title="Smart Job Portal", layout="wide")
 
@@ -523,6 +523,61 @@ with tab1:
                 session.commit()
                 st.success(f"Deleted {count} jobs permanently.")
                 st.rerun()
+
+        with st.expander("Review an email alert or calendar reminder"):
+            st.caption("Choose a job and review the details. Each outgoing action needs its own approval.")
+            notification_jobs = {job.id: job for job in jobs}
+            notification_job_id = st.selectbox(
+                "Job for notification",
+                options=list(notification_jobs),
+                format_func=lambda job_id: f"{notification_jobs[job_id].title} at {notification_jobs[job_id].company}",
+            )
+            if st.button("Prepare notification preview"):
+                notification_job = notification_jobs[notification_job_id]
+                st.session_state['notification_preview'] = {
+                    'job_id': notification_job.id,
+                    'title': notification_job.title,
+                    'company': notification_job.company,
+                    'url': notification_job.url,
+                    'email': build_email_preview(notification_job.title, notification_job.company, notification_job.url),
+                    'calendar_day': datetime.date.today().isoformat(),
+                    'email_attempted': False,
+                    'calendar_attempted': False,
+                }
+            preview = st.session_state.get('notification_preview')
+            if preview and preview['job_id'] == notification_job_id:
+                st.text(f"To: {preview['email']['to'] or 'Email account is not configured'}")
+                st.text(f"Subject: {preview['email']['subject']}")
+                st.code(preview['email']['body'], language=None)
+                if st.button("Approve and send this email", disabled=preview['email_attempted'] or not preview['email']['to']):
+                    # Do not automatically retry uncertain SMTP outcomes or let a
+                    # repeated button event reuse the same approval.
+                    preview['email_attempted'] = True
+                    if send_email_notification(preview['title'], preview['company'], preview['url'], approved=True):
+                        st.success("Email submitted to the displayed recipient.")
+                        try:
+                            session.query(Job).filter(
+                                Job.id == preview['job_id'],
+                                Job.status.in_([JobStatus.NEW, JobStatus.QUEUED]),
+                            ).update({Job.status: JobStatus.NOTIFIED}, synchronize_session=False)
+                            session.commit()
+                        except Exception:
+                            session.rollback()
+                            st.warning("Email was submitted, but its history entry could not be saved. Do not resend it.")
+                    else:
+                        st.warning("Delivery was not confirmed. Check your mailbox before preparing another preview.")
+                calendar_day = datetime.date.fromisoformat(preview['calendar_day'])
+                st.text(f"Calendar: Apply: {preview['title']} — all day on {calendar_day.isoformat()}")
+                if st.button("Approve and add this calendar reminder", disabled=preview['calendar_attempted']):
+                    preview['calendar_attempted'] = True
+                    try:
+                        created = create_calendar_note(preview['title'], preview['url'], approved=True, day=calendar_day)
+                    except Exception:
+                        created = False
+                    if created:
+                        st.success("Calendar reminder created.")
+                    else:
+                        st.warning("Reminder creation was not confirmed. Check your calendar before preparing another preview.")
     else:
         st.info("No jobs found matching filters.")
 

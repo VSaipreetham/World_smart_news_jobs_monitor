@@ -2,19 +2,6 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 require('dotenv').config();
-require('dotenv').config({ path: path.resolve(__dirname, '../backend/.env'), override: false });
-try {
-    const sharedEnv = require('dotenv').parse(fs.readFileSync(path.resolve(__dirname, '../../smart_job_portal/.env')));
-    const sharedAllowlist = [
-        'OPENROUTER_API_KEY', 'Qwen3_80b_token', 'Qwen3_4b_token', 'gpt-oss-120b_token',
-        'Gemma3b_token', 'Gemma4_26b_token', 'Gemma4_31b_token',
-        'HUGGINGFACE_API_KEY', 'HF_TOKEN', 'YOUTUBE_API_KEY', 'YOUTUBE_CLIENT_ID',
-        'YOUTUBE_CLIENT_SECRET', 'YOUTUBE_REFRESH_TOKEN', 'LINKEDIN_FEED_URLS',
-    ];
-    sharedAllowlist.forEach(key => {
-        if (!process.env[key] && sharedEnv[key]) process.env[key] = sharedEnv[key];
-    });
-} catch (_) { }
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -23,7 +10,9 @@ const axios = require('axios');
 const Parser = require('rss-parser');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const ytSearch = require('yt-search');
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
+const { createAutomation, requireOwner, isOwner } = require('./automation/routes');
+const { IntelligenceSession } = require('./intelligenceSession');
 const mammoth = require('mammoth');
 const { JOB_APIS, JOB_RSS_FEEDS, JOB_BOARD_SOURCES, NEWS_RSS_FEEDS, HN_QUERIES } = require('./sources');
 const { getDailyNewsSources, getLinkedInImports, getDailyNewsBridgeStatus } = require('./dailyNewsBridge');
@@ -41,8 +30,15 @@ async function withRetry(fn, retries = 2, delayMs = 1000) {
 }
 
 const app = express();
-app.use(cors());
+const allowedOrigins = String(process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || !allowedOrigins.length || allowedOrigins.includes(origin)) }));
 app.use(express.json({ limit: '2mb' }));
+// The public monitor is read-only; private application data and mutations require the owner key.
+app.use('/api', (req, res, next) => {
+    if (req.path.startsWith('/automation/')) return next();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) || ['/portal-jobs', '/portal-export.csv'].includes(req.path)) return requireOwner(req, res, next);
+    next();
+});
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 // ═══════════════════════════════════════════════════════════════
@@ -87,7 +83,7 @@ const VIDEO_CACHE_LIMIT = Number(process.env.VIDEO_CACHE_LIMIT || 180);
 const YOUTUBE_API_PAGES = Math.max(1, Math.min(3, Number(process.env.YOUTUBE_API_PAGES || 2)));
 const YOUTUBE_API_QUERY_LIMIT = Math.max(1, Math.min(12, Number(process.env.YOUTUBE_API_QUERY_LIMIT || 6)));
 const JOB_MAX_AGE_DAYS = Number(process.env.JOB_MAX_AGE_DAYS || 30);
-const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 14);
+const NEWS_MAX_AGE_DAYS = Number(process.env.NEWS_MAX_AGE_DAYS || 7);
 const VIDEO_DB_RETENTION_HOURS = Number(process.env.VIDEO_DB_RETENTION_HOURS || 72);
 const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
 const OLLAMA_CLOUD_BASE_URL = String(process.env.OLLAMA_CLOUD_BASE_URL || 'https://ollama.com').replace(/\/$/, '');
@@ -164,9 +160,33 @@ let pool = null;
 if (process.env.DATABASE_URL) {
     let dbUrl = process.env.DATABASE_URL;
     if (dbUrl.startsWith('postgres://')) dbUrl = dbUrl.replace('postgres://', 'postgresql://');
-    pool = new Pool({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
+    pool = new Pool({ connectionString: dbUrl, ssl: { rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false' }, max: 12, connectionTimeoutMillis: 10000 });
     console.log("✅ Connected to Neon PostgreSQL");
 }
+
+const automation = createAutomation({ pool, generate: async prompt => {
+    const result = await getAIInsight(prompt);
+    if (typeof result === 'string') { try { return JSON.parse(result.replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch { return null; } }
+    return result;
+} });
+app.use('/api/automation', automation.router);
+const intelligence = new IntelligenceSession({ store: automation.store, generate: async prompt => coerceModelObject(await getAIInsight(prompt)) });
+let intelligenceReady = false;
+app.use('/api/intelligence', (_req, res, next) => intelligenceReady ? next() : res.status(503).json({ error: 'The intelligence session is starting. Try again shortly.' }));
+app.get('/api/intelligence/session', async (req, res, next) => {
+    try {
+        if (req.headers.authorization && !isOwner(req)) return res.status(401).json({ error: 'Reconnect your private workspace.' });
+        if (cache.dashboardData?.length) await intelligence.syncNews(cache.dashboardData.filter(item => item.type === 'news'), cache.dashboardData.filter(item => item.type === 'job'));
+        res.set('Cache-Control', 'no-store').json(await intelligence.read(isOwner(req)));
+    } catch (error) { next(error); }
+});
+app.post('/api/intelligence/messages', async (req, res, next) => {
+    try { res.set('Cache-Control', 'no-store').json(await intelligence.ask(req.body.message, req.body.requestId)); }
+    catch (error) { if (error.status) return res.status(error.status).json({ error: error.message }); next(error); }
+});
+app.post('/api/intelligence/cleanup', async (_req, res, next) => {
+    try { res.set('Cache-Control', 'no-store').json(await intelligence.compact()); } catch (error) { next(error); }
+});
 
 // Ensure tables exist
 async function ensureDBTables() {
@@ -243,17 +263,18 @@ async function ensureDBTables() {
     } catch (e) { console.error("DB table creation error:", e.message); }
 }
 
-// ═══════ 3-HOUR DATABASE PURGE ═══════
+// Remove expired public news while preserving tracked applications.
 async function pruneDatabase() {
     if (!pool) return;
-    console.log(`\n🗑️ [${new Date().toLocaleTimeString()}] PURGING DATABASE - 3 hour cycle...`);
+    console.log(`\n[${new Date().toLocaleTimeString()}] Applying database retention...`);
     try {
         const interval = `${DB_RETENTION_HOURS} hours`;
         const videoInterval = `${VIDEO_DB_RETENTION_HOURS} hours`;
-        await pool.query("DELETE FROM jobs WHERE COALESCE(last_seen_at, refreshed_at, created_at) < NOW() - $1::interval;", [interval]);
-        await pool.query("DELETE FROM news WHERE COALESCE(last_seen_at, refreshed_at, created_at) < NOW() - $1::interval;", [interval]);
+        await pool.query("UPDATE jobs SET status='archived',archived_at=COALESCE(archived_at,NOW()) WHERE LOWER(COALESCE(status,'open')) IN ('open','new') AND COALESCE(notes,'')='' AND applied_at IS NULL AND follow_up_at IS NULL AND COALESCE(last_seen_at, refreshed_at, created_at) < NOW() - $1::interval;", [interval]);
+        await pool.query("DELETE FROM news WHERE COALESCE(source_published_at, first_seen_at, created_at) < NOW() - $1::interval;", [`${NEWS_MAX_AGE_DAYS} days`]);
+        await pool.query('DELETE FROM news WHERE id IN (SELECT id FROM news ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC OFFSET 5000)');
         await pool.query("DELETE FROM youtube_videos WHERE COALESCE(refreshed_at, created_at) < NOW() - $1::interval;", [videoInterval]);
-        console.log("✅ Database purged successfully. Fresh collection starting...");
+        console.log('Database retention complete; application history retained.');
     } catch (e) { console.error("❌ Purge error:", e.message); }
 }
 
@@ -1620,17 +1641,17 @@ async function cleanupKnownJobNoise() {
     if (!pool) return;
     try {
         await pool.query(`
-            DELETE FROM jobs
-            WHERE LOWER(COALESCE(source, '')) LIKE '%ncs%'
+            UPDATE jobs SET status='archived',archived_at=COALESCE(archived_at,NOW())
+            WHERE LOWER(COALESCE(status,'open')) IN ('open','new') AND COALESCE(notes,'')='' AND applied_at IS NULL AND follow_up_at IS NULL AND LOWER(COALESCE(source, '')) LIKE '%ncs%'
               AND LOWER(COALESCE(title, '')) ~ '(manual|handbook|flowchart|registration|post new job|view jobs|jobs archives|job fairs|model career centers|career schemes|career information|links to govt|find domestic|find international|training by)';
         `);
         await pool.query(`
-            DELETE FROM jobs
-            WHERE LOWER(TRIM(COALESCE(title, ''))) IN ('software development','content writing','consulting','business consulting','business analysis','debugging','agile development','project management','prototyping','mobile app development','web development','data management','international jobs','marketing','data entry','translation','research','training','design','testing','advisories for international jobseeker','international resources','post international jobs','ncs meta data','international job opportunities');
+            UPDATE jobs SET status='archived',archived_at=COALESCE(archived_at,NOW())
+            WHERE LOWER(COALESCE(status,'open')) IN ('open','new') AND COALESCE(notes,'')='' AND applied_at IS NULL AND follow_up_at IS NULL AND LOWER(TRIM(COALESCE(title, ''))) IN ('software development','content writing','consulting','business consulting','business analysis','debugging','agile development','project management','prototyping','mobile app development','web development','data management','international jobs','marketing','data entry','translation','research','training','design','testing','advisories for international jobseeker','international resources','post international jobs','ncs meta data','international job opportunities');
         `);
         await pool.query(`
-            DELETE FROM jobs
-            WHERE source = ANY($1::text[])
+            UPDATE jobs SET status='archived',archived_at=COALESCE(archived_at,NOW())
+            WHERE LOWER(COALESCE(status,'open')) IN ('open','new') AND COALESCE(notes,'')='' AND applied_at IS NULL AND follow_up_at IS NULL AND source = ANY($1::text[])
               AND (
                 LOWER(COALESCE(title, '')) ~ '(salary|salaries|join now|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|privacy|terms|about us|contact us|sign in|login)'
                 OR LOWER(COALESCE(title, '')) !~ '(engineer|developer|architect|analyst|scientist|specialist|consultant|manager|designer|writer|administrator|officer|executive|associate|assistant|trainee|intern|operator|technician|accountant|recruiter|sales|support|nurse|teacher|lead|director|head|python|react|node|java|golang|devops|full.?stack|front.?end|back.?end|software|cloud|security|machine learning|data)'
@@ -1638,9 +1659,9 @@ async function cleanupKnownJobNoise() {
               );
         `, [JOB_BOARD_SOURCES.map(source => source.name)]);
         await pool.query(`
-            DELETE FROM jobs older
-            USING jobs newer
-            WHERE older.id < newer.id
+            UPDATE jobs older SET status='archived',archived_at=COALESCE(older.archived_at,NOW())
+            FROM jobs newer
+            WHERE LOWER(COALESCE(older.status,'open')) IN ('open','new') AND COALESCE(older.notes,'')='' AND older.applied_at IS NULL AND older.follow_up_at IS NULL AND older.id < newer.id
               AND LOWER(TRIM(COALESCE(older.title, ''))) = LOWER(TRIM(COALESCE(newer.title, '')))
               AND LOWER(TRIM(COALESCE(older.company, ''))) = LOWER(TRIM(COALESCE(newer.company, '')))
               AND LOWER(TRIM(COALESCE(older.source, ''))) = LOWER(TRIM(COALESCE(newer.source, '')))
@@ -2658,50 +2679,15 @@ app.get('/api/videos', async (req, res) => {
     });
 });
 
-app.get('/api/ai-insights', async (req, res) => {
-    let videos = await refreshVideosIfNeeded(false);
+// Compatibility endpoint: read the same saved brief rather than generating another
+// model response on every dashboard poll.
+app.get('/api/ai-insights', async (_req, res, next) => {
+    if (!intelligenceReady) return res.status(503).json({ error: 'intelligence_starting' });
     try {
-        const newsSlice = (cache.dashboardData || []).filter(d => d.type === 'news').slice(0, 10);
-        const jobsSlice = (cache.dashboardData || []).filter(d => d.type === 'job').slice(0, 5);
-        const totalNews = (cache.dashboardData || []).filter(d => d.type === 'news').length;
-        const totalJobs = (cache.dashboardData || []).filter(d => d.type === 'job').length;
-
-        if (newsSlice.length === 0 || jobsSlice.length === 0) {
-            return res.json({ summary_news: "Initializing Live Intelligence.", summary_jobs: "Starting Global Scan.", videos: videos.slice(0, 24) });
-        }
-
-        const prompt = `You are a Silicon Valley Intelligence Analyst. Analyze:
-NEWS: ${newsSlice.map(n => n.headline).join(' | ')}
-JOBS: ${jobsSlice.map(j => `${j.company} hiring ${j.title}`).join(' | ')}
-Provide: 1) "summary_news": 3-sentence tech trends summary. 2) "summary_jobs": 2-sentence hiring summary.
-Return JSON: {"summary_news":"...","summary_jobs":"..."}`;
-
-        const aiJson = await getAIInsight(prompt);
-        if (aiJson) {
-            aiJson.videos = videos.slice(0, 24);
-            aiJson.provider = aiRuntime.lastProvider;
-            aiJson.model = aiRuntime.lastModel;
-            aiJson.fallback = false;
-            return res.json(aiJson);
-        }
-        res.json({
-            summary_news: `Live data active across ${totalNews} news signals.`,
-            summary_jobs: `${totalJobs} tracked roles are currently active.`,
-            videos: videos.slice(0, 24),
-            provider: 'Deterministic',
-            model: 'offline-summary',
-            fallback: true,
-        });
-    } catch (e) {
-        res.json({
-            summary_news: "AI Unavailable. Live Streams Active.",
-            summary_jobs: "Global Hiring Active.",
-            videos: videos.slice(0, 24),
-            provider: 'Deterministic',
-            model: 'offline-summary',
-            fallback: true,
-        });
-    }
+        if (cache.dashboardData?.length) await intelligence.syncNews(cache.dashboardData.filter(item => item.type === 'news'), cache.dashboardData.filter(item => item.type === 'job'));
+        const session = await intelligence.read(false);
+        res.json({ ...session.brief, sessionId: session.id, updatedAt: session.updatedAt, videos: cache.videos.slice(0, 24), provider: 'Source digest', model: 'source-headlines', fallback: true });
+    } catch (error) { next(error); }
 });
 
 app.get('/api/company-intel', async (req, res) => {
@@ -2727,8 +2713,8 @@ app.post('/api/portal-resume-upload', upload.single('resume'), async (req, res) 
     try {
         let text = '';
         if (mime.includes('pdf') || lowerName.endsWith('.pdf')) {
-            const parsed = await pdfParse(req.file.buffer);
-            text = parsed.text || '';
+            const parser = new PDFParse({ data: req.file.buffer });
+            try { text = (await parser.getText()).text || ''; } finally { await parser.destroy(); }
         } else if (mime.includes('wordprocessingml') || lowerName.endsWith('.docx')) {
             const parsed = await mammoth.extractRawText({ buffer: req.file.buffer });
             text = parsed.value || '';
@@ -2753,9 +2739,11 @@ app.post('/api/portal-resume-upload', upload.single('resume'), async (req, res) 
 });
 
 app.get('/api/portal-jobs', async (req, res) => {
-    if (!pool) return res.json({ jobs: [], total: 0 });
-    const { search, page = 1, limit = 20, location, source, status } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+    if (!pool) return res.status(503).json({ error: 'database_unavailable', jobs: [], total: 0 });
+    const { search, location, source, status } = req.query;
+    const page = Math.max(1, Math.min(100000, parseInt(req.query.page, 10) || 1));
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
 
     let whereClause = '';
     const params = [];
@@ -2805,7 +2793,7 @@ app.get('/api/portal-jobs', async (req, res) => {
         res.json({ jobs: jobsRes.rows, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) });
     } catch (e) {
         console.error("Portal jobs error:", e.message);
-        res.json({ jobs: [], total: 0 });
+        res.status(503).json({ error: 'job_query_failed', jobs: [], total: 0 });
     }
 });
 
@@ -2814,7 +2802,9 @@ app.patch('/api/portal-jobs/:id', async (req, res) => {
     const id = Number(req.params.id);
     const status = req.body.status ? normalizeJobStatus(req.body.status) : null;
     const notes = typeof req.body.notes === 'string' ? req.body.notes.slice(0, 5000) : null;
+    const hasFollowUp = Object.hasOwn(req.body, 'follow_up_at');
     const followUpAt = req.body.follow_up_at || null;
+    if (hasFollowUp && followUpAt && !Number.isFinite(Date.parse(followUpAt))) return res.status(400).json({ error: 'invalid_follow_up_date' });
     const updates = [];
     const params = [];
     let c = 1;
@@ -2828,7 +2818,7 @@ app.patch('/api/portal-jobs/:id', async (req, res) => {
         updates.push(`notes = $${c++}`);
         params.push(notes);
     }
-    if (followUpAt !== null) {
+    if (hasFollowUp) {
         updates.push(`follow_up_at = $${c++}`);
         params.push(followUpAt ? new Date(followUpAt).toISOString() : null);
     }
@@ -3080,7 +3070,7 @@ app.get('/api/portal-export.csv', async (req, res) => {
              FROM jobs ORDER BY COALESCE(source_published_at, first_seen_at, created_at) DESC, id DESC LIMIT 5000`
         );
         const headers = ['id', 'title', 'company', 'location', 'pay', 'source', 'status', 'match_score', 'posted_date', 'applied_at', 'follow_up_at', 'notes', 'url'];
-        const escapeCsv = value => `"${String(value ?? '').replace(/"/g, '""')}"`;
+        const escapeCsv = value => `"${String(value ?? '').replace(/^[=+@\t\r-]/, "'$&").replace(/"/g, '""')}"`;
         const csv = [headers.join(','), ...jobsRes.rows.map(row => headers.map(h => escapeCsv(row[h])).join(','))].join('\n');
         res.setHeader('Content-Type', 'text/csv');
         res.setHeader('Content-Disposition', 'attachment; filename="smart-job-portal-export.csv"');
@@ -3097,11 +3087,12 @@ app.get('/api/stats', (req, res) => res.json({ ...cache.stats, health: getServic
 // ═══════════════════════════════════════════════════════════════
 app.use((err, req, res, next) => {
     console.error(`❌ Unhandled error on ${req.method} ${req.path}:`, err.message);
-    res.status(500).json({ error: 'internal_server_error', message: err.message });
+    res.status(500).json({ error: 'internal_server_error' });
 });
 
 function gracefulShutdown(signal) {
     console.log(`\n⚠️ ${signal} received. Shutting down gracefully...`);
+    automation.engine.stop();
     if (typeof pool !== 'undefined' && pool) pool.end().catch(() => {});
     process.exit(0);
 }
@@ -3117,6 +3108,11 @@ app.listen(PORT, async () => {
     console.log(`📊 Job Sources: ${JOB_APIS.length} APIs + ${JOB_RSS_FEEDS.length} RSS + ${JOB_BOARD_SOURCES.length} boards = ${getTotalJobSources()} total`);
     console.log(`📰 News Sources: ${NEWS_RSS_FEEDS.length} RSS + ${HN_QUERIES.length} HN queries = ${NEWS_RSS_FEEDS.length + HN_QUERIES.length} total`);
     await ensureDBTables();
+    await automation.init();
+    await intelligence.init();
+    intelligenceReady = true;
+    if (process.env.DISABLE_BACKGROUND_JOBS === 'true') return;
+    automation.engine.start();
     await cleanupKnownJobNoise();
     await refreshAllData({ preloadOnly: true });
     setTimeout(() => {
@@ -3124,5 +3120,5 @@ app.listen(PORT, async () => {
     }, 2 * 60 * 1000);
     setInterval(() => refreshAllData(), REFRESH_INTERVAL);
     setInterval(() => pruneDatabase(), DB_PURGE_INTERVAL);
-    console.log(`⏱️  Auto-refresh: every 10 min | DB purge: every 3 hours`);
+    console.log(`Auto-refresh: ${REFRESH_INTERVAL / 60000} min | Retention maintenance: ${DB_PURGE_INTERVAL / 60000} min`);
 });

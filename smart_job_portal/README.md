@@ -30,8 +30,8 @@ A powerful, AI-driven local job aggregator and career assistant. This dashboard 
 
 ### ⚙️ Automation
 - **Background Scrapers**: Automatically fetches new jobs periodically.
-- **Google Calendar Integration**: Auto-schedule interviews or reminders.
-- **Email Notifications**: Get "Drip Feed" summaries of top jobs.
+- **Google Calendar Integration**: Review and explicitly approve a job reminder in the Inbox.
+- **Email Notifications**: Preview the recipient and message, then approve each email. Scheduled sends are disabled.
 
 ---
 
@@ -70,8 +70,8 @@ Create a `.env` file in the root directory:
 ```env
 Google_token=YOUR_GEMINI_API_KEY
 # Optional: Email configuration for notifications
-EMAIL_USER=your_email@gmail.com
-EMAIL_PASS=your_app_password
+GMAIL_USER=your_email@gmail.com
+GMAIL_APP_PASSWORD=your_app_password
 ```
 
 ### 4. Running the App
@@ -79,6 +79,31 @@ EMAIL_PASS=your_app_password
 streamlit run app.py
 ```
 The application will launch at `http://localhost:8501`.
+
+Scheduled cleanup retains application history and daily notification logs. It
+expires only untouched `NEW`/`open` listings older than 30 days; notes, queued or
+notified jobs, application statuses, and any available application or reminder
+timestamps prevent deletion. Set `JOB_RETENTION_DAYS` to a positive integer to
+change the retention window.
+
+Email and calendar actions require an explicit approval button after reviewing a
+job's notification preview in the Inbox. The scheduler only collects, exports,
+and expires untouched listings. It cannot send email or create calendar events.
+An attempted action is not retried automatically; check the destination before
+preparing another preview if delivery is uncertain.
+
+The optional Streamlit portal and Node service currently declare different job
+schemas: Streamlit uses an enum status and datetime `posted_date`, while Node
+uses text. Use separate databases until an explicit shared-schema migration is
+implemented. Cleanup tolerates either column layout, but does not migrate the
+portal's ORM or existing enum values.
+
+From the repository root, run the offline regression tests (no service credentials required):
+
+```bash
+python -m unittest discover -s smart_job_portal/tests -p 'test_job_retention.py'
+python -m unittest discover -s smart_job_portal/tests -p 'test_notification_approval.py'
+```
 
 ---
 

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   frontend:
     build:
@@ -17,6 +15,8 @@ services:
       context: ./backend_node
     ports:
       - "8000:8000"
+    volumes:
+      - automation_data:/app/data
     env_file:
       - ./backend_node/.env
     restart: unless-stopped
@@ -24,6 +24,7 @@ services:
       - monitor_net
 
   smart_job_portal:
+    profiles: [legacy]
     build:
       context: ./smart_job_portal
     ports:
@@ -37,3 +38,7 @@ services:
 networks:
   monitor_net:
     driver: bridge
+
+
+volumes:
+  automation_data:

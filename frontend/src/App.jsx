@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import Globe from 'react-globe.gl';
 import {
   Activity,
   ArrowUpRight,
@@ -37,7 +36,10 @@ import {
   Sun,
 } from 'lucide-react';
 import './App.css';
+import { getOwnerKey } from './automationApi';
+import IntelligenceSession from './IntelligenceSession';
 
+const Globe = React.lazy(() => import('./GlobeView.jsx'));
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 const FEED_LIMIT = 80;
 const PORTAL_LIMIT = 18;
@@ -54,11 +56,19 @@ function apiUrl(path, base = API_BASES[0] || '') {
 }
 
 async function apiFetch(path, options) {
+  const request = { ...options, headers: new Headers(options?.headers) };
+  if (getOwnerKey()) request.headers.set('Authorization', `Bearer ${getOwnerKey()}`);
+  // Only reads may fail over. Retrying a write can duplicate a completed action.
+  const bases = ['GET', 'HEAD'].includes((options?.method || 'GET').toUpperCase()) ? API_BASES : API_BASES.slice(0, 1);
   let lastResponse = null;
   let lastError = null;
-  for (const base of API_BASES) {
+  for (const base of bases) {
     try {
-      const response = await fetch(apiUrl(path, base), options);
+      const response = await fetch(apiUrl(path, base), request);
+      if (response.status === 401 || response.status === 403) {
+        window.dispatchEvent(new CustomEvent('world:owner-required'));
+        return response;
+      }
       if (response.ok) return response;
       lastResponse = response;
     } catch (error) {
@@ -86,9 +96,13 @@ function formatAge(seconds) {
 }
 
 function formatDateAge(value) {
-  if (!value) return 'fresh check';
-  const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
+  if (!value || !Number.isFinite(Date.parse(value))) return 'date unavailable';
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(value)) / 1000));
   return formatAge(seconds);
+}
+
+function escapeTooltip(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
 
 function normalizeVideos(videos = []) {
@@ -215,6 +229,13 @@ export default function App() {
   
   const searchTimerRef = useRef(null);
   const notesTimerRef = useRef(null);
+  const portalRequestRef = useRef(0);
+
+  useEffect(() => {
+    const notifyOwner = () => addToast('Open Career workspace and connect your owner access key to use private features.', 'error');
+    window.addEventListener('world:owner-required', notifyOwner);
+    return () => { window.removeEventListener('world:owner-required', notifyOwner); clearTimeout(searchTimerRef.current); clearTimeout(notesTimerRef.current); };
+  }, [addToast]);
 
   const [data, setData] = useState([]);
   const [trends, setTrends] = useState([]);
@@ -224,7 +245,6 @@ export default function App() {
   const [videoTotalPages, setVideoTotalPages] = useState(1);
   const [health, setHealth] = useState(null);
   const [stats, setStats] = useState({});
-  const [insight, setInsight] = useState({ summary_news: 'Building live intelligence brief.', summary_jobs: 'Scanning current hiring signals.' });
   const [selectedPoint, setSelectedPoint] = useState(null);
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState('all');
@@ -319,15 +339,6 @@ export default function App() {
         const json = await res.json();
         setTrends(json.trends || []);
       }),
-      apiFetch('/api/ai-insights').then(async (res) => {
-        if (!res.ok) return;
-        const json = await res.json();
-        setInsight(json);
-        setAiAttribution((current) => ({
-          ...current,
-          insight: { provider: json.provider, model: json.model, fallback: json.fallback },
-        }));
-      }),
       fetchVideoPage(1),
     ]);
   }, [fetchVideoPage]);
@@ -413,17 +424,35 @@ export default function App() {
   };
 
   const fetchPortalJobs = async (page = 1, search = portalQuery, status = portalStatus) => {
+    const sequence = ++portalRequestRef.current;
     const params = new URLSearchParams({
       page: String(page),
       limit: String(PORTAL_LIMIT),
       search,
       status,
     });
-    const res = await apiFetch(`/api/portal-jobs?${params.toString()}`);
-    const json = await res.json();
-    setPortalJobs(json.jobs || []);
-    setPortalTotal(json.total || 0);
-    setPortalPage(json.page || page);
+    try {
+      const res = await apiFetch(`/api/portal-jobs?${params.toString()}`);
+      if (!res.ok) throw new Error(res.status === 401 ? 'Connect the owner key in Career workspace to see private jobs.' : 'The job service is unavailable. Your saved records are retained.');
+      const json = await readApiJson(res);
+      if (sequence !== portalRequestRef.current) return;
+      setPortalJobs(json.jobs || []);
+      setPortalTotal(json.total || 0);
+      setPortalPage(json.page || page);
+    } catch (error) {
+      if (sequence === portalRequestRef.current) addToast(error.message, 'error');
+    }
+  };
+
+  const exportPortalJobs = async () => {
+    try {
+      const response = await apiFetch('/api/portal-export.csv');
+      if (!response.ok) throw new Error('Connect the owner key in Career workspace before exporting private jobs.');
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url; link.download = 'career-jobs.csv'; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { addToast(error.message, 'error'); }
   };
 
   const fetchPortalAnalytics = async () => {
@@ -921,45 +950,47 @@ export default function App() {
             {isLoading ? (
               <div className="loader"><RefreshCcw className="spin" size={28} /> Connecting live feeds</div>
             ) : (
-              <Globe
-                ref={globeRef}
-                globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
-                backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
-                pointsData={globeMode === 'news' ? [] : globeJobs}
-                pointLat="lat"
-                pointLng="lng"
-                pointColor={() => '#15b86a'}
-                pointRadius={(d) => d.size || 0.36}
-                pointAltitude={0.01}
-                pointLabel={(d) => `${d.title || 'Role'}<br/>${d.company || 'Company'} - ${d.location || 'Remote'}`}
-                ringsData={globeMode === 'jobs' ? [] : globeNews}
-                ringLat="lat"
-                ringLng="lng"
-                ringColor={() => '#ef4444'}
-                ringMaxRadius={(d) => d.radius || 3.6}
-                ringPropagationSpeed={0.55}
-                ringRepeatPeriod={900}
-                arcsData={globeMode === 'opportunity' ? opportunityArcs : []}
-                arcStartLat="startLat"
-                arcStartLng="startLng"
-                arcEndLat="endLat"
-                arcEndLng="endLng"
-                arcColor={() => ['rgba(239,68,68,0.18)', 'rgba(21,184,106,0.92)']}
-                arcAltitude={0.18}
-                arcStroke={0.45}
-                arcDashLength={0.36}
-                arcDashGap={1.1}
-                arcDashAnimateTime={2600}
-                labelsData={globeClusters}
-                labelLat="lat"
-                labelLng="lng"
-                labelText="label"
-                labelColor={() => '#ffffff'}
-                labelSize={(d) => Math.min(1.45, 0.72 + d.count * 0.05)}
-                labelDotRadius={(d) => Math.min(0.7, 0.18 + d.count * 0.025)}
-                labelAltitude={0.025}
-                onPointClick={setSelectedPoint}
-              />
+              <React.Suspense fallback={<div className="loader"><RefreshCcw className="spin" size={24} /> Loading interactive map</div>}>
+                <Globe
+                  ref={globeRef}
+                  globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
+                  backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
+                  pointsData={globeMode === 'news' ? [] : globeJobs}
+                  pointLat="lat"
+                  pointLng="lng"
+                  pointColor={() => '#15b86a'}
+                  pointRadius={(d) => d.size || 0.36}
+                  pointAltitude={0.01}
+                  pointLabel={(d) => `${escapeTooltip(d.title || 'Role')}<br/>${escapeTooltip(d.company || 'Company')} - ${escapeTooltip(d.location || 'Location unavailable')}`}
+                  ringsData={globeMode === 'jobs' ? [] : globeNews}
+                  ringLat="lat"
+                  ringLng="lng"
+                  ringColor={() => '#ef4444'}
+                  ringMaxRadius={(d) => d.radius || 3.6}
+                  ringPropagationSpeed={0.55}
+                  ringRepeatPeriod={900}
+                  arcsData={globeMode === 'opportunity' ? opportunityArcs : []}
+                  arcStartLat="startLat"
+                  arcStartLng="startLng"
+                  arcEndLat="endLat"
+                  arcEndLng="endLng"
+                  arcColor={() => ['rgba(239,68,68,0.18)', 'rgba(21,184,106,0.92)']}
+                  arcAltitude={0.18}
+                  arcStroke={0.45}
+                  arcDashLength={0.36}
+                  arcDashGap={1.1}
+                  arcDashAnimateTime={2600}
+                  labelsData={globeClusters}
+                  labelLat="lat"
+                  labelLng="lng"
+                  labelText="label"
+                  labelColor={() => '#ffffff'}
+                  labelSize={(d) => Math.min(1.45, 0.72 + d.count * 0.05)}
+                  labelDotRadius={(d) => Math.min(0.7, 0.18 + d.count * 0.025)}
+                  labelAltitude={0.025}
+                  onPointClick={setSelectedPoint}
+                />
+              </React.Suspense>
             )}
             {!isLoading && (
               <div className="globe-intel">
@@ -1002,16 +1033,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="panel-section">
-              <span className="section-kicker"><Sparkles size={15} /> AI Brief</span>
-              <p className="brief-text">{insight.summary_news}</p>
-              <p className="brief-text muted">{insight.summary_jobs}</p>
-              <div className="model-line">
-                <Bot size={14} />
-                <span>{health?.ai?.available === false ? 'AI cooldown active' : (health?.ai?.provider || stats.modelProvider || 'Fallback router')} / {aiLabel}</span>
-              </div>
-              <AiBadge meta={aiAttribution.insight || health?.ai} label="Brief" />
-            </div>
+            <IntelligenceSession request={apiFetch} />
 
             <div className="panel-section">
               <span className="section-kicker"><Filter size={15} /> Controls</span>
@@ -1292,7 +1314,7 @@ export default function App() {
               ].map(([id, label]) => (
                 <button key={id} className={portalTab === id ? 'active' : ''} onClick={() => setPortalTab(id)}>{label}</button>
               ))}
-              <a href={apiUrl('/api/portal-export.csv')} className="export-link">Export CSV</a>
+              <button onClick={exportPortalJobs} className="export-link">Export CSV</button>
             </div>
             {(portalTab === 'inbox' || portalTab === 'applications') && <div className="portal-search">
               <div className="search-box">
@@ -1322,7 +1344,6 @@ export default function App() {
               <div className="portal-workbench">
                 <div className="portal-list">
                   {portalJobs
-                    .filter((job) => portalTab === 'inbox' ? !['applied', 'interview', 'offer'].includes(job.status) : ['applied', 'interview', 'offer', 'rejected'].includes(job.status))
                     .map((job) => (
                       <div className="portal-job-shell" key={job.id || job.url}>
                         <button className={`portal-job ${selectedPortalJob?.id === job.id ? 'active' : ''}`} onClick={() => setSelectedPortalJob(job)}>

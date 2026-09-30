@@ -164,3 +164,10 @@ smart_job_portal/__pycache__/
 smart_job_portal/jobs*.db
 smart_job_portal/backups/
 smart_job_portal/jobs_list.xlsx
+
+
+# Private automation state and secrets
+backend_node/data/
+*.sqlite*
+.env.*
+!.env.example

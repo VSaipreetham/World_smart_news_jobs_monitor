@@ -1,0 +1,35 @@
+name: Validate job workflow
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            backend_node/package-lock.json
+            frontend/package-lock.json
+      - run: npm --prefix backend_node ci
+      - run: npm --prefix backend_node run check
+      - run: npm --prefix backend_node test
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend test
+      - run: npm --prefix frontend run build
+  retention:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install sqlalchemy
+      - run: python -m unittest discover -s smart_job_portal/tests -p test_job_retention.py
+      - run: python -m unittest discover -s smart_job_portal/tests -p test_notification_approval.py

@@ -1,35 +1,7 @@
-# Instructions
+# Repository instructions
 
-## Overview
-This repository contains the "World Smart News & Jobs Monitoring" application. A sophisticated, real-time 3D dashboard combining AI-powered news aggregation and job market intelligence into a single unified situational awareness interface.
+Active application: React19/Vite frontend/ and Node24/Express backend_node/. Integrated job workflow: backend_node/automation/. backend/ is an older FastAPI prototype. smart_job_portal/ is optional Streamlit with a different schema.
 
-## Architecture
-1. **Frontend**: Vite + React + Vanilla CSS + react-globe.gl + framer-motion
-2. **Backend**: FastAPI (Python) with integration to Neon PostgreSQL Database, OpenAI/Gemini/Ollama based AI Summarization.
-3. **Data Pipeline**: Python-based scraper jobs, news RSS aggregation, caching, and embeddings generation.
+Read README.md and INSTRUCTIONS.md. Preserve the news monitor. Never commit credentials, resumes or private records. Every outgoing application email requires exact-content owner approval, including in AA mode. Notice default60days. Never invent source coverage, compensation or successful submissions.
 
-## Setup Instructions
-
-### Environment
-1. Requires Node v18+ and Python 3.10+.
-
-### Frontend
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### Backend
-```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
-
-## Security & Deployment
-* **Vercel** for optimal frontend static hosting.
-* **Railway** or AWS App Runner for Python FastAPI.
-* **Neon DB** for connection pooling and Serverless usage.
+Run Node tests and frontend build. Use provider mocks offline. Keep keys server-side and owner access in browser memory.

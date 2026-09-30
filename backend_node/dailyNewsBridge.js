@@ -2,7 +2,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const { scrapeLinkedInArticlesViaGoogle, getLinkedInProxyStatus } = require('./linkedinScraper');
 
-const DEFAULT_ROOT = path.resolve(__dirname, '../../smart_job_portal/daily_news_updater');
+const DEFAULT_ROOT = path.resolve(__dirname, '../smart_job_portal/daily_news_updater');
 const root = path.resolve(process.env.DAILY_NEWS_UPDATER_PATH || DEFAULT_ROOT);
 
 async function readJson(relativePath, fallback) {
@@ -10,15 +10,7 @@ async function readJson(relativePath, fallback) {
     try {
         return JSON.parse(await fs.readFile(fullPath, 'utf8'));
     } catch (error) {
-        if (error.code === 'ENOENT') {
-            try {
-                await fs.mkdir(path.dirname(fullPath), { recursive: true });
-                await fs.writeFile(fullPath, JSON.stringify(fallback, null, 2));
-            } catch (mkdirError) {
-                console.error(`❌ [Bridge] Could not create fallback file ${relativePath}`, mkdirError.message);
-            }
-            return fallback;
-        }
+        if (error.code === 'ENOENT') return fallback;
         throw error;
     }
 }
@@ -75,6 +67,7 @@ async function getLinkedInImports() {
 
 async function getDailyNewsBridgeStatus() {
     try {
+        await fs.access(path.join(root, 'config/sources.json'));
         const [sources, linkedIn] = await Promise.all([getDailyNewsSources(), getLinkedInImports()]);
         return {
             connected: true,
@@ -87,7 +80,7 @@ async function getDailyNewsBridgeStatus() {
             linkedinProxy: getLinkedInProxyStatus(),
         };
     } catch (error) {
-        return { connected: false, mode: 'read_only', root, error: error.message };
+        return { connected: false, mode: 'read_only', error: 'News bridge configuration unavailable' };
     }
 }
 
@@ -96,3 +89,4 @@ module.exports = {
     getLinkedInImports,
     getDailyNewsBridgeStatus,
 };
+

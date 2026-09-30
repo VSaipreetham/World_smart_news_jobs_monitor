@@ -1,14 +1,15 @@
 import os.path
 import datetime
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 def get_calendar_service():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
     creds = None
     # The file token.json stores the user's access and refresh tokens, and is
     # created automatically when the authorization flow completes for the first
@@ -33,22 +34,25 @@ def get_calendar_service():
     service = build('calendar', 'v3', credentials=creds)
     return service
 
-def create_calendar_note(job_title, job_url):
+def create_calendar_note(job_title, job_url, *, approved=False, day=None):
+    if approved is not True:
+        print("Calendar reminder not created: explicit approval is required.")
+        return False
     service = get_calendar_service()
     if not service:
         print("Calendar service not available.")
         return False
 
-    today = datetime.date.today().isoformat()
+    today = day or datetime.date.today()
     
     event = {
       'summary': f'Apply: {job_title}',
       'description': f'Link: {job_url}',
       'start': {
-        'date': today,
+        'date': today.isoformat(),
       },
       'end': {
-        'date': today,
+        'date': (today + datetime.timedelta(days=1)).isoformat(),
       },
       'colorId': '11', # Red
       'transparency': 'transparent', # Available (Note)
