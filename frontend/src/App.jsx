@@ -309,6 +309,7 @@ export default function App() {
   const [modelSearch, setModelSearch] = useState('');
   const [modelProviderFilter, setModelProviderFilter] = useState('all');
   const [copiedModel, setCopiedModel] = useState('');
+  const openRouterProvider = freeModels?.providers?.find((provider) => provider.id === 'openrouter');
 
   const fetchOperationalConfig = useCallback(async () => {
     const [modesRes, sourcesRes, modelsRes, integrationsRes, healthRes, automationRes] = await Promise.allSettled([
@@ -1368,9 +1369,9 @@ export default function App() {
               </div>
             ) : (
               <div className="portal-command">
-                <Metric icon={Briefcase} label="Tracked" value={portalAnalytics?.totals?.jobs || portalTotal || 0} />
-                <Metric icon={Activity} label="Applied" value={portalAnalytics?.totals?.applied || 0} />
-                <Metric icon={ShieldCheck} label="Interviews" value={portalAnalytics?.totals?.interviews || 0} />
+                <Metric icon={Briefcase} label="Tracked" value={automationSummary?.ownerConfigured === false ? "Locked" : (portalAnalytics?.totals?.jobs || portalTotal || 0)} />
+                <Metric icon={Activity} label="Applied" value={automationSummary?.ownerConfigured === false ? "Locked" : (portalAnalytics?.totals?.applied || 0)} />
+                <Metric icon={ShieldCheck} label="Interviews" value={automationSummary?.ownerConfigured === false ? "Locked" : (portalAnalytics?.totals?.interviews || 0)} />
                 <label className="ai-mode-control">
                   <span>AI mode</span>
                   <select value={aiMode} onChange={(event) => changeAiMode(event.target.value)}>
@@ -1617,7 +1618,7 @@ export default function App() {
                 </div>
 
                 {automationSummary?.ownerConfigured === false && (
-                  <div className="model-access-note" role="status">OpenRouter is configured and reachable. A response test uses private backend credentials, so it stays locked until owner access is configured. <a href="?workspace=jobs">Connect Career workspace <ArrowUpRight size={13} /></a></div>
+                  <div className="model-access-note" role="status">{openRouterProvider?.configured ? `OpenRouter is configured${openRouterProvider.reachable ? " and recently reachable." : ", but no recent response check is recorded."}` : "No hosted provider key is configured."} A response test uses private backend credentials, so it stays locked until owner access is configured. <a href="?workspace=jobs">Connect Career workspace <ArrowUpRight size={13} /></a></div>
                 )}
 
                 <div className="model-catalog-controls">
