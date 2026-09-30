@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
-    "test": "npm run check"
+    "test": "node --test automation/*.test.js",
+    "benchmark:directory": "node automation/benchmark-directory.js"
   },
   "keywords": [],
   "author": "",
@@ -24,7 +25,9 @@
     "pdf-parse": "^2.4.5",
     "pg": "^8.20.0",
     "rss-parser": "^3.13.0",
-    "sqlite3": "^5.1.7",
     "yt-search": "^2.13.1"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }

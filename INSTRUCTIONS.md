@@ -1,106 +1,40 @@
-# Smart News and Job Tracker - System Documentation
+# Architecture and operations
 
-## 📌 Architecture Overview
-This application is a **Global Intelligence & Jobs Engine** that tracks real-time jobs, tech news, AI research, and YouTube streams from **1200+ sources worldwide**.
+Two React views share the Express backend: Jobs and the original world monitor. The job workflow is part of this repository and preserves the news pipeline.
 
-### Components:
-- **Frontend (React + Vite):** 3D Globe visualization using `react-globe.gl` with real-time data points
-- **Backend (Node.js/Express):** Scraping engine on port `8000` with 10-minute auto-refresh
-- **Smart Job Portal (Streamlit):** Full-featured job CRM with AI career coaching
-- **Database (Neon PostgreSQL):** Cloud database with 3-hour auto-purge cycle
+    React owner workspace -> protected API -> profile and résumé
+    Official ATS feeds -> normalize -> filters -> persistent dedupe -> matches
+    Matches -> AA preparation or RM review -> employer form completion
+    Matches -> durable Slack outbox -> configured private channel
+    Matches -> Qdrant/local evidence retrieval -> cited research answers
+    Candidate evidence -> optional Jev assessment -> review requirements
+    Email draft -> explicit content-bound approval -> configured transport
 
-## 📊 Data Sources
+## Trust boundaries
 
-### Jobs (200+ Sources)
-- **APIs:** Remotive (7 categories), TheMuse (6 categories), HackerNews Jobs
-- **RSS Feeds:** WeWorkRemotely, RemoteOK, Jobicy, AuthenticJobs, Dribbble Jobs, crypto.jobs, Web3 Career, USAJobs, Arbeitnow, TechnoJobs, Naukri, SEEK, Jobberman, Computrabajo, Torre, and 50+ more worldwide
-- **Regions:** North America, Europe, Asia, Africa, Middle East, Latin America, Oceania
+Public directory records contain career URLs. Profiles, résumés, preferences, matches, applications, drafts and mutations require the owner key. This is a single-owner application, not multi-user SaaS authentication. Do not share the owner key with untrusted users.
 
-### News (1000+ Sources)
-- **Tier 1 (50):** TechCrunch, The Verge, Ars Technica, Wired, BBC Tech, Reuters Tech, CNET, ZDNet, Engadget, Mashable
-- **Tier 2 (100+):** MIT AI Blog, Google AI, OpenAI, NVIDIA, Meta AI, DeepMind, HuggingFace, Anthropic, Stability AI
-- **Tier 3 (18):** ArXiv feeds (cs.AI, cs.LG, cs.CL, cs.CV, cs.NE, cs.RO, cs.CR, cs.SE, stat.ML)
-- **Tier 4 (50+):** Dev.to, CSS-Tricks, GitHub Blog, Docker Blog, Kubernetes, Cloud blogs (AWS, GCP, Azure)
-- **Tier 5 (20+):** Crunchbase, PitchBook, YC News, ProductHunt, a16z, Sequoia
-- **Tier 6 (15):** Nature, Science, PhysOrg, Quanta Magazine, IEEE Spectrum
-- **Tier 7-12:** Cybersecurity, Blockchain, Regional Tech, Gaming, Data, Space/Robotics
+External job descriptions are evidence, never instructions. ATS URLs are constructed from supported providers with timeouts and budgets. Neither Jev nor AA grants email permission. Keys stay on the backend, never in React, browser storage, public source records or Slack messages.
 
-## 🧠 AI Multi-Model Fallback Matrix
-1. **Gemini 2.0 Flash** (Primary)
-2. **Gemini 1.5 Flash** (Fallback #1)
-3. **Gemini 2.5 Flash Preview** (Fallback #2)
-4. **OpenRouter Qwen3 235B** (Fallback #3)
-5. **OpenRouter GPT-4o-mini** (Final fallback)
+## Recovery and lifecycle
 
-## 🔄 Auto-Refresh Cycles
-- **10-minute cycle:** Backend scrapes all sources, refreshes cache, frontend re-fetches
-- **3-hour cycle:** Database purge (TRUNCATE all tables) to prevent unbounded growth
-- **Immediate refresh:** After every purge, data is scraped fresh
+Canonical URLs identify jobs. Source refreshes preserve application progress. A worker lease prevents overlapping cycles. Slack uses a durable outbox and stable message identifiers; ambiguous delivery requires careful recovery and does not imply exactly-once third-party delivery.
 
-## 🗄️ Database Schema (Neon PostgreSQL)
-```sql
--- Jobs table
-CREATE TABLE jobs (
-    id SERIAL PRIMARY KEY,
-    title TEXT, company TEXT, url TEXT UNIQUE,
-    source TEXT, location TEXT, pay TEXT,
-    posted_date TEXT, status TEXT DEFAULT 'open',
-    created_at TIMESTAMP DEFAULT NOW()
-);
+Email approval binds recipient, subject, body, résumé hash and profile revision. An uncertain send is not retried automatically. Verify the sent folder first. Ready means a packet is prepared, not submitted; an employer confirmation reference is required to record applied.
 
--- News table
-CREATE TABLE news (
-    id SERIAL PRIMARY KEY,
-    headline TEXT, source TEXT, url TEXT UNIQUE,
-    category TEXT, snippet TEXT, published_date TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
+Qdrant is an index, not the source of truth. Results must be checked against current authorized SQL job records. Local retrieval remains available during provider failure. Jev output is validated and cannot weaken rules.
 
--- YouTube videos table
-CREATE TABLE youtube_videos (
-    id SERIAL PRIMARY KEY,
-    title TEXT, video_id TEXT UNIQUE,
-    channel TEXT, published TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-```
+Directory capacity is not a verified ranking of the top 100,000 companies. Import licensed records with official career URLs. There are no generated placeholder companies to fill counts.
 
-## 🚀 How to Run
+## Hosting
 
-### 1. Backend Server
-```bash
-cd backend_node
-npm install
-node server.js
-```
+- Scheduling requires an awake process. Source interval is a minimum cadence; backlog and failure affect latency.
+- Use PostgreSQL for hosted persistence. SQLite requires a persistent volume and one worker.
+- The optional Streamlit ORM has different status/timestamp types; use a separate database until a reviewed migration exists.
+- Retention preserves application history, notes, follow-ups and notification logs.
+- Rotate keys shared in chat before production. Never commit .env, local databases, credentials or résumés.
+- Set CORS_ORIGINS to your frontend origin. DISABLE_BACKGROUND_JOBS=true disables recurring work for tests.
 
-### 2. Frontend React Client
-```bash
-cd frontend
-npm install
-npm run dev
-```
+## Release validation
 
-### 3. Smart Job Portal (Optional)
-```bash
-cd smart_job_portal
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## 🔑 Environment Variables Required (.env)
-```
-Google_token=<Gemini API Key>
-DATABASE_URL=<Neon PostgreSQL Connection String>
-Qwen3_80b_token=<OpenRouter API Key>
-gpt-oss-120b_token=<OpenRouter API Key>
-```
-
-## 📡 API Endpoints
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/dashboard-data` | Returns all scraped jobs + news with geo coords |
-| `GET /api/latest-trends` | Returns trending articles from 15+ top sources |
-| `GET /api/ai-insights` | AI-generated summaries + YouTube videos |
-| `GET /api/company-intel?company=X` | AI-generated company branch locations |
-| `GET /api/stats` | Source counts and scraping statistics |
+Run tests and the production build. Then verify the private Slack destination and an explicitly authorized alert, configured Jev responses, and Qdrant index/query operations against the actual cluster. Verify email only with a reviewed and approved draft. The app must never report success from merely starting an HTTP request.

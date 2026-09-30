@@ -1,11 +1,11 @@
 # Build stage
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
 # Install dependencies
 COPY package*.json ./
-RUN npm install
+RUN PUPPETEER_SKIP_DOWNLOAD=true npm ci
 
 # Copy source and build
 COPY . .
