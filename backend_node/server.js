@@ -2394,7 +2394,7 @@ app.get('/api/free-models', async (req, res) => {
                 id: 'ollama',
                 name: 'Ollama',
                 kind: OLLAMA_MODELS.some(id => id.endsWith(':cloud')) ? 'hybrid' : 'local',
-                configured: true,
+                configured: Boolean(ollama.reachable || process.env.OLLAMA_BASE_URL || process.env.OLLAMA_API_KEY),
                 reachable: ollama.reachable,
                 pricingNote: 'Ollama is free to run locally; your computer provides the hardware. Cloud-tagged models may require an account or paid entitlement.',
                 docsUrl: 'https://ollama.com/library',
