@@ -7,9 +7,11 @@ import {
   Building2,
   ChevronLeft,
   ChevronRight,
+  Check,
   Clock3,
   Cloud,
   Compass,
+  Copy,
   Cpu,
   Database,
   ExternalLink,
@@ -29,6 +31,7 @@ import {
   TrendingUp,
   Upload,
   Video,
+  Workflow,
   Zap,
   X,
   Bell,
@@ -173,6 +176,25 @@ function modelStatusLabel(status) {
   return labels[status] || 'Needs attention';
 }
 
+class GlobeErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error) {
+    console.warn('Interactive globe unavailable; keeping monitor controls active.', error?.message || error);
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
 function AiBadge({ meta, label = 'AI' }) {
   const provider = meta?.provider || 'Deterministic';
   const model = cleanModelLabel(meta?.model || meta?.modelName);
@@ -281,6 +303,10 @@ export default function App() {
   const [resumeFileName, setResumeFileName] = useState('');
   const [aiAttribution, setAiAttribution] = useState({});
   const [globeMode, setGlobeMode] = useState('opportunity');
+  const [timeRange, setTimeRange] = useState('7d');
+  const [modelSearch, setModelSearch] = useState('');
+  const [modelProviderFilter, setModelProviderFilter] = useState('all');
+  const [copiedModel, setCopiedModel] = useState('');
 
   const fetchOperationalConfig = useCallback(async () => {
     const [modesRes, sourcesRes, modelsRes, integrationsRes, healthRes] = await Promise.allSettled([
@@ -493,6 +519,16 @@ export default function App() {
     }
   };
 
+  const copyModelId = async (modelId) => {
+    try {
+      await navigator.clipboard.writeText(modelId);
+      setCopiedModel(modelId);
+      window.setTimeout(() => setCopiedModel(''), 1800);
+    } catch {
+      addToast('Clipboard access is unavailable in this browser.', 'error');
+    }
+  };
+
   const scrapeSelectedSources = async () => {
     if (!selectedJobSources.length) return;
     setPortalBusy(true);
@@ -681,20 +717,36 @@ export default function App() {
 
   const scopedSignals = useMemo(() => {
     const lower = query.trim().toLowerCase();
+    const maxAge = timeRange === '24h' ? 24 * 60 * 60 * 1000 : timeRange === '7d' ? 7 * 24 * 60 * 60 * 1000 : Infinity;
     return data
       .filter((item) => mode === 'all' || item.type === mode)
+      .filter((item) => {
+        if (!Number.isFinite(maxAge)) return true;
+        const timestamp = Number(item.publishedAt || item.sourcePublishedAt || item.collectedAt) || Date.parse(item.publishedAt || item.sourcePublishedAt || '');
+        return Number.isFinite(timestamp) && Date.now() - timestamp <= maxAge;
+      })
       .filter((item) => matchesQuery(item, lower));
-  }, [data, matchesQuery, mode, query]);
+  }, [data, matchesQuery, mode, query, timeRange]);
 
   const scopedJobs = useMemo(() => {
     const lower = query.trim().toLowerCase();
-    return jobs.filter((item) => matchesQuery(item, lower));
-  }, [jobs, matchesQuery, query]);
+    const maxAge = timeRange === '24h' ? 24 * 60 * 60 * 1000 : timeRange === '7d' ? 7 * 24 * 60 * 60 * 1000 : Infinity;
+    return jobs.filter((item) => matchesQuery(item, lower)).filter((item) => {
+      if (!Number.isFinite(maxAge)) return true;
+      const timestamp = Number(item.publishedAt || item.sourcePublishedAt || item.collectedAt) || Date.parse(item.publishedAt || item.sourcePublishedAt || '');
+      return Number.isFinite(timestamp) && Date.now() - timestamp <= maxAge;
+    });
+  }, [jobs, matchesQuery, query, timeRange]);
 
   const scopedNews = useMemo(() => {
     const lower = query.trim().toLowerCase();
-    return news.filter((item) => matchesQuery(item, lower));
-  }, [matchesQuery, news, query]);
+    const maxAge = timeRange === '24h' ? 24 * 60 * 60 * 1000 : timeRange === '7d' ? 7 * 24 * 60 * 60 * 1000 : Infinity;
+    return news.filter((item) => matchesQuery(item, lower)).filter((item) => {
+      if (!Number.isFinite(maxAge)) return true;
+      const timestamp = Number(item.publishedAt || item.sourcePublishedAt || item.collectedAt) || Date.parse(item.publishedAt || item.sourcePublishedAt || '');
+      return Number.isFinite(timestamp) && Date.now() - timestamp <= maxAge;
+    });
+  }, [matchesQuery, news, query, timeRange]);
 
   const filteredFeed = useMemo(() => scopedSignals.slice(0, FEED_LIMIT), [scopedSignals]);
 
@@ -772,17 +824,17 @@ export default function App() {
       .sort((a, b) => b[1] - a[1])
       .slice(0, limit)
       .map(([label, count]) => ({ label, count }));
-    const remoteJobs = jobs.filter((job) => /remote|anywhere|global|worldwide/i.test(`${job.location || ''} ${job.title || ''}`));
-    const aiJobs = jobs.filter((job) => /ai|machine learning|ml|rag|llm|data scientist|genai/i.test(`${job.title || ''} ${job.company || ''}`));
-    const freshNews = news.filter((item) => item.collectedAt && Date.now() - item.collectedAt < 24 * 60 * 60 * 1000);
+    const remoteJobs = scopedJobs.filter((job) => /remote|anywhere|global|worldwide/i.test(`${job.location || ''} ${job.title || ''}`));
+    const aiJobs = scopedJobs.filter((job) => /ai|machine learning|ml|rag|llm|data scientist|genai/i.test(`${job.title || ''} ${job.company || ''}`));
+    const freshNews = scopedNews.filter((item) => item.collectedAt && Date.now() - item.collectedAt < 24 * 60 * 60 * 1000);
     const recentSignals = [...scopedSignals]
       .sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0))
       .slice(0, 7);
     const roleFamilies = [
       { label: 'AI / ML', count: aiJobs.length, query: 'ai', tone: 'blue' },
       { label: 'Remote', count: remoteJobs.length, query: 'remote', tone: 'green' },
-      { label: 'Cloud', count: jobs.filter((job) => /cloud|devops|aws|azure|gcp|platform/i.test(job.title || '')).length, query: 'cloud', tone: 'violet' },
-      { label: 'Frontend', count: jobs.filter((job) => /react|frontend|ui|javascript|web/i.test(job.title || '')).length, query: 'react', tone: 'amber' },
+      { label: 'Cloud', count: scopedJobs.filter((job) => /cloud|devops|aws|azure|gcp|platform/i.test(job.title || '')).length, query: 'cloud', tone: 'violet' },
+      { label: 'Frontend', count: scopedJobs.filter((job) => /react|frontend|ui|javascript|web/i.test(job.title || '')).length, query: 'react', tone: 'amber' },
     ];
     return {
       missions: [
@@ -800,7 +852,7 @@ export default function App() {
           icon: Compass,
           label: 'Remote hunt',
           value: remoteJobs.length,
-          detail: `${Math.round((remoteJobs.length / Math.max(jobs.length, 1)) * 100)}% of tracked jobs`,
+          detail: `${Math.round((remoteJobs.length / Math.max(scopedJobs.length, 1)) * 100)}% of jobs in this window`,
           query: 'remote',
           mode: 'jobs',
         },
@@ -828,13 +880,13 @@ export default function App() {
       corridors: globeClusters.slice(0, 6),
       recentSignals,
       totals: {
-        jobs: jobs.length,
-        news: news.length,
+        jobs: scopedJobs.length,
+        news: scopedNews.length,
         freshNews: freshNews.length,
         sources: countBy(scopedSignals, (item) => item.company || item.source, 1000).length,
       },
     };
-  }, [globeClusters, jobs, news, opportunityArcs.length, radarSummary.hotspot, radarSummary.hotspotCount, scopedSignals]);
+  }, [globeClusters, opportunityArcs.length, radarSummary.hotspot, radarSummary.hotspotCount, scopedJobs, scopedNews, scopedSignals]);
   const freshTone = health?.lastError ? 'danger' : health?.isRefreshing ? 'warn' : 'good';
   const aiLabel = health?.ai?.available === false
     ? 'cooldown'
@@ -950,47 +1002,49 @@ export default function App() {
             {isLoading ? (
               <div className="loader"><RefreshCcw className="spin" size={28} /> Connecting live feeds</div>
             ) : (
-              <React.Suspense fallback={<div className="loader"><RefreshCcw className="spin" size={24} /> Loading interactive map</div>}>
-                <Globe
-                  ref={globeRef}
-                  globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
-                  backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
-                  pointsData={globeMode === 'news' ? [] : globeJobs}
-                  pointLat="lat"
-                  pointLng="lng"
-                  pointColor={() => '#15b86a'}
-                  pointRadius={(d) => d.size || 0.36}
-                  pointAltitude={0.01}
-                  pointLabel={(d) => `${escapeTooltip(d.title || 'Role')}<br/>${escapeTooltip(d.company || 'Company')} - ${escapeTooltip(d.location || 'Location unavailable')}`}
-                  ringsData={globeMode === 'jobs' ? [] : globeNews}
-                  ringLat="lat"
-                  ringLng="lng"
-                  ringColor={() => '#ef4444'}
-                  ringMaxRadius={(d) => d.radius || 3.6}
-                  ringPropagationSpeed={0.55}
-                  ringRepeatPeriod={900}
-                  arcsData={globeMode === 'opportunity' ? opportunityArcs : []}
-                  arcStartLat="startLat"
-                  arcStartLng="startLng"
-                  arcEndLat="endLat"
-                  arcEndLng="endLng"
-                  arcColor={() => ['rgba(239,68,68,0.18)', 'rgba(21,184,106,0.92)']}
-                  arcAltitude={0.18}
-                  arcStroke={0.45}
-                  arcDashLength={0.36}
-                  arcDashGap={1.1}
-                  arcDashAnimateTime={2600}
-                  labelsData={globeClusters}
-                  labelLat="lat"
-                  labelLng="lng"
-                  labelText="label"
-                  labelColor={() => '#ffffff'}
-                  labelSize={(d) => Math.min(1.45, 0.72 + d.count * 0.05)}
-                  labelDotRadius={(d) => Math.min(0.7, 0.18 + d.count * 0.025)}
-                  labelAltitude={0.025}
-                  onPointClick={setSelectedPoint}
-                />
-              </React.Suspense>
+              <GlobeErrorBoundary fallback={<div className="globe-fallback"><div><span><Globe2 size={18} /> LIVE SIGNAL MAP</span><h2>Signals stay live without the 3D map</h2><p>This browser cannot start WebGL. News, job feeds, search, and Career Desk are still available below.</p><strong>{worldCommand.totals.jobs} jobs · {worldCommand.totals.news} news · {globeClusters.length} active regions</strong></div><div className="globe-fallback-regions">{globeClusters.slice(0, 6).map((cluster) => <button key={cluster.label} onClick={() => { setQuery(cluster.label); window.scrollTo({ top: 0, behavior: 'smooth' }); }}><span>{cluster.label}</span><small>{cluster.jobs} jobs · {cluster.news} news</small><ArrowUpRight size={14} /></button>)}</div></div>}>
+                <React.Suspense fallback={<div className="loader"><RefreshCcw className="spin" size={24} /> Loading interactive map</div>}>
+                  <Globe
+                    ref={globeRef}
+                    globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
+                    backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
+                    pointsData={globeMode === 'news' ? [] : globeJobs}
+                    pointLat="lat"
+                    pointLng="lng"
+                    pointColor={() => '#15b86a'}
+                    pointRadius={(d) => d.size || 0.36}
+                    pointAltitude={0.01}
+                    pointLabel={(d) => `${escapeTooltip(d.title || 'Role')}<br/>${escapeTooltip(d.company || 'Company')} - ${escapeTooltip(d.location || 'Location unavailable')}`}
+                    ringsData={globeMode === 'jobs' ? [] : globeNews}
+                    ringLat="lat"
+                    ringLng="lng"
+                    ringColor={() => '#ef4444'}
+                    ringMaxRadius={(d) => d.radius || 3.6}
+                    ringPropagationSpeed={0.55}
+                    ringRepeatPeriod={900}
+                    arcsData={globeMode === 'opportunity' ? opportunityArcs : []}
+                    arcStartLat="startLat"
+                    arcStartLng="startLng"
+                    arcEndLat="endLat"
+                    arcEndLng="endLng"
+                    arcColor={() => ['rgba(239,68,68,0.18)', 'rgba(21,184,106,0.92)']}
+                    arcAltitude={0.18}
+                    arcStroke={0.45}
+                    arcDashLength={0.36}
+                    arcDashGap={1.1}
+                    arcDashAnimateTime={2600}
+                    labelsData={globeClusters}
+                    labelLat="lat"
+                    labelLng="lng"
+                    labelText="label"
+                    labelColor={() => '#ffffff'}
+                    labelSize={(d) => Math.min(1.45, 0.72 + d.count * 0.05)}
+                    labelDotRadius={(d) => Math.min(0.7, 0.18 + d.count * 0.025)}
+                    labelAltitude={0.025}
+                    onPointClick={setSelectedPoint}
+                  />
+                </React.Suspense>
+              </GlobeErrorBoundary>
             )}
             {!isLoading && (
               <div className="globe-intel">
@@ -1068,6 +1122,14 @@ export default function App() {
               <span>{worldCommand.totals.sources} sources</span>
               <span>{worldCommand.totals.freshNews} fresh</span>
             </div>
+          </div>
+
+          <div className="world-time-filter" role="group" aria-label="World signal time range">
+            <span>Time window</span>
+            {[["24h", "24 hours"], ["7d", "7 days"], ["all", "All loaded"]].map(([id, label]) => (
+              <button key={id} className={timeRange === id ? 'active' : ''} onClick={() => setTimeRange(id)} aria-pressed={timeRange === id}>{label}</button>
+            ))}
+            <small>{scopedSignals.length} signals in this view</small>
           </div>
 
           <div className="mission-grid">
@@ -1278,9 +1340,9 @@ export default function App() {
             </div>
             {portalTab === 'models' ? (
               <div className="model-console-banner">
-                <div><Server size={18} /><span>Local first<strong>{freeModels?.providers?.find((provider) => provider.id === 'ollama')?.installed?.length || 0} installed</strong></span></div>
-                <div><Cloud size={18} /><span>Hosted backup<strong>{freeModels?.providers?.filter((provider) => provider.id !== 'ollama' && provider.reachable).length || 0} connected</strong></span></div>
-                <div><ShieldCheck size={18} /><span>Final safety net<strong>Offline evidence mode</strong></span></div>
+                <div><Server size={18} /><span>Run locally<strong>{freeModels?.providers?.find((provider) => provider.id === 'ollama')?.installed?.length || 0} models installed</strong></span></div>
+                <div><Cloud size={18} /><span>Hosted free tiers<strong>{freeModels?.providers?.filter((provider) => provider.id !== 'ollama' && provider.configured).length || 0} configured</strong></span></div>
+                <div><ShieldCheck size={18} /><span>Private fallback<strong>Offline evidence mode</strong></span></div>
               </div>
             ) : (
               <div className="portal-command">
@@ -1302,6 +1364,13 @@ export default function App() {
                 </button>
               </div>
             )}
+            {portalTab !== 'models' && <section className="career-workflow" aria-label="Career desk workflow">
+              <div className="career-workflow-copy"><span className="section-kicker"><Workflow size={14} /> Career workflow</span><strong>Discover → verify → match → prepare → review</strong><small>Search and preparation can run automatically. Application emails and final submissions stay approval gated.</small></div>
+              <div className="career-workflow-steps">
+                {[["inbox", "1 · Matches"], ["sources", "2 · Sources"], ["coach", "3 · Resume"], ["applications", "4 · Track"]].map(([id, label]) => <button key={id} className={portalTab === id ? 'active' : ''} onClick={() => setPortalTab(id)}>{label}<ArrowRight size={13} /></button>)}
+              </div>
+              <button className="career-workflow-refresh" onClick={refreshJobs} disabled={portalBusy || isRefreshing}><RefreshCcw size={14} /> Refresh jobs</button>
+            </section>}
             <div className="portal-tabs">
               {[
                 ['inbox', 'Inbox'],
@@ -1513,8 +1582,15 @@ export default function App() {
                         {aiModes.map((modeOption) => <option key={modeOption.id} value={modeOption.id}>{modeOption.label}{modeOption.available === false ? ' (unavailable)' : ''}</option>)}
                       </select>
                     </label>
+                    <button onClick={() => { setPortalBusy(true); setBusyLabel('Refreshing model catalog'); void fetchOperationalConfig().finally(() => { setPortalBusy(false); setBusyLabel(''); }); }} disabled={portalBusy}><RefreshCcw size={15} /> Refresh catalog</button>
                     <button onClick={runModelHealthCheck} disabled={portalBusy}><Activity size={15} /> Test engines</button>
                   </div>
+                </div>
+
+                <div className="model-catalog-controls">
+                  <label className="search-box"><Search size={15} /><input aria-label="Search free model catalog" placeholder="Search models by name or purpose" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} /></label>
+                  <select aria-label="Filter model provider" value={modelProviderFilter} onChange={(event) => setModelProviderFilter(event.target.value)}><option value="all">All providers</option>{(freeModels?.providers || []).map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select>
+                  <span>Local models use your own hardware. Hosted free tiers can have changing quotas and availability.</span>
                 </div>
 
                 {modelProbeResult && (
@@ -1526,25 +1602,29 @@ export default function App() {
                 )}
 
                 <div className="provider-grid">
-                  {(freeModels?.providers || []).map((provider) => (
+                  {(freeModels?.providers || []).filter((provider) => modelProviderFilter === 'all' || provider.id === modelProviderFilter).map((provider) => {
+                    const visibleModels = (provider.models || []).filter((model) => `${model.name || ''} ${model.id || ''} ${model.purpose || ''}`.toLowerCase().includes(modelSearch.trim().toLowerCase()));
+                    return (
                     <section className={`provider-panel ${provider.reachable ? 'online' : 'offline'}`} key={provider.id}>
                       <header>
                         {provider.kind === 'local' ? <Server size={19} /> : <Cloud size={19} />}
-                        <div><strong>{provider.name}</strong><span>{provider.kind === 'local' ? 'This PC' : provider.kind === 'hybrid' ? 'This PC and cloud' : 'Online fallback'}</span></div>
-                        <em>{provider.reachable ? 'Connected' : 'Unavailable'}</em>
+                        <div><strong>{provider.name}</strong><span>{provider.kind === 'local' ? 'Local runtime' : provider.kind === 'hybrid' ? 'Local and cloud runtime' : 'Hosted inference'}</span></div>
+                        <em>{provider.reachable ? 'Reachable' : provider.configured ? 'Configured · test' : 'Setup needed'}</em>
                       </header>
-                      <p>{provider.note}</p>
+                      <p>{provider.pricingNote || provider.note}</p>
                       <div className="model-list model-route-list">
-                        {(provider.models || []).slice(0, 8).map((model) => (
+                        {visibleModels.map((model) => (
                           <div className="model-route-row" key={model.id}>
-                            <i className={model.health?.ok || model.installed ? 'ready' : ''} />
+                            <i className={model.health?.ok || (provider.id === 'ollama' && model.installed) ? 'ready' : ''} aria-hidden="true" />
                             <span><strong>{model.name || cleanModelLabel(model.id)}</strong><small>{model.purpose || `${model.deployment || 'hosted'} response engine`}</small></span>
-                            <em>{modelStatusLabel(model.health?.status || (model.installed ? 'ready' : 'untested'))}</em>
+                            <span className="model-route-actions"><em>{modelStatusLabel(model.health?.status || (model.installed && provider.id === 'ollama' ? 'installed' : 'not_tested'))}</em><button onClick={() => copyModelId(model.id)} title={`Copy ${model.id}`} aria-label={`Copy model identifier ${model.id}`}>{copiedModel === model.id ? <Check size={14} /> : <Copy size={14} />}</button></span>
                           </div>
                         ))}
+                        {!visibleModels.length && <p className="model-empty">No models match this search.</p>}
                       </div>
+                      {provider.docsUrl && <a className="provider-docs" href={provider.docsUrl} target="_blank" rel="noreferrer">Provider setup and limits <ExternalLink size={13} /></a>}
                     </section>
-                  ))}
+                  );})}
                 </div>
 
                 <div className="runtime-grid">

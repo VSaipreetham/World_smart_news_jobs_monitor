@@ -911,6 +911,18 @@ function canonicalSourceUrl(value) {
     }
 }
 
+function normalizeSignalText(value) {
+    return cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+function jobFingerprint(job = {}) {
+    return [job.title, job.company, job.location].map(normalizeSignalText).join('|');
+}
+
+function newsFingerprint(item = {}) {
+    return normalizeSignalText(item.headline || item.title);
+}
+
 const NON_JOB_ANCHOR_PATTERN = /(salary|salaries|manual|handbook|flowchart|registration|login|sign in|join now|post new job|post international jobs|employer|recruiter|view jobs|jobs archives|job fairs|jobs by|job alerts|jobs app|report an issue|resume database|find companies|find more jobs|career advice|model career centers|career schemes|career information|links to govt|find domestic|find international|training by|advisories|international resources|ncs meta data|international job opportunities|privacy|terms|about us|contact us|faq|help|sitemap)/i;
 const GENERIC_NON_ROLE_PATTERN = /^(software development|software testing|content writing|consulting|business consulting|business analysis|debugging|agile development|project management|prototyping|mobile app development|web development|data management|international jobs|marketing|digital marketing|data entry|translation|research|training|design|graphic design|accounting|call center|electrical engineering|event management|artificial intelligence)$/i;
 const ROLE_TITLE_PATTERN = /(engineer|developer|architect|analyst|scientist|specialist|consultant|manager|designer|writer|administrator|officer|executive|associate|assistant|trainee|intern|operator|technician|accountant|recruiter|sales|support|nurse|teacher|lead|director|head|python|react|node|java|golang|devops|full[ -]?stack|front[ -]?end|back[ -]?end|software|cloud|security|machine learning|data)/i;
@@ -1174,9 +1186,15 @@ const getScrapedJobs = async (refreshRunId = null, sourceIds = []) => {
         if (j.sourcePublishedAt && !isRecentDate(j.sourcePublishedAt, JOB_MAX_AGE_DAYS)) return false;
         if (!isLikelyPersistableJob(j)) return false;
         const canonicalUrl = canonicalSourceUrl(j.url);
-        if (!canonicalUrl || seen.has(canonicalUrl)) return false;
+        if (!canonicalUrl) return false;
+        let parsedUrl;
+        try { parsedUrl = new URL(canonicalUrl); } catch { return false; }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol) || parsedUrl.hostname === 'localhost') return false;
+        const fingerprint = jobFingerprint(j);
+        if (seen.has(canonicalUrl) || (fingerprint !== '||' && seen.has(fingerprint))) return false;
         j.url = canonicalUrl;
         seen.add(canonicalUrl);
+        if (fingerprint !== '||') seen.add(fingerprint);
         return true;
     });
 
@@ -1280,9 +1298,15 @@ const getScrapedNews = async (refreshRunId = null) => {
     const seen = new Set();
     const uniqueNews = sortByDateDesc(candidateNews).filter(n => {
         const canonicalUrl = canonicalSourceUrl(n.url);
-        if (!canonicalUrl || seen.has(canonicalUrl)) return false;
+        if (!canonicalUrl) return false;
+        let parsedUrl;
+        try { parsedUrl = new URL(canonicalUrl); } catch { return false; }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) return false;
+        const fingerprint = newsFingerprint(n);
+        if (seen.has(canonicalUrl) || (fingerprint && seen.has(fingerprint))) return false;
         n.url = canonicalUrl;
         seen.add(canonicalUrl);
+        if (fingerprint) seen.add(fingerprint);
         return true;
     });
     uniqueNews.forEach(item => {
@@ -2370,8 +2394,10 @@ app.get('/api/free-models', async (req, res) => {
                 id: 'ollama',
                 name: 'Ollama',
                 kind: OLLAMA_MODELS.some(id => id.endsWith(':cloud')) ? 'hybrid' : 'local',
-                configured: true,
+                configured: Boolean(ollama.reachable || process.env.OLLAMA_BASE_URL || process.env.OLLAMA_API_KEY),
                 reachable: ollama.reachable,
+                pricingNote: 'Ollama is free to run locally; your computer provides the hardware. Cloud-tagged models may require an account or paid entitlement.',
+                docsUrl: 'https://ollama.com/library',
                 endpoint: ollama.endpoint,
                 models: OLLAMA_MODELS.map(id => {
                     const definition = MODEL_ROUTE_DEFINITIONS.find(item => item.model() === id);
@@ -2396,7 +2422,9 @@ app.get('/api/free-models', async (req, res) => {
                 name: 'OpenRouter Free',
                 kind: 'hosted',
                 configured: getOpenRouterTokens().length > 0,
-                reachable: getOpenRouterTokens().length > 0,
+                reachable: OPENROUTER_MODELS.some(id => getModelHealth('OpenRouter', id, 'not_tested').ok),
+                pricingNote: 'Free-tagged routes are offered by the provider; availability, rate limits, and model terms can change. Add an API key, then test a route.',
+                docsUrl: 'https://openrouter.ai/models?max_price=0',
                 models: OPENROUTER_MODELS.map(id => ({
                     id,
                     name: id === 'openrouter/free' ? 'OpenRouter automatic fallback' : cleanText(id.split('/').pop()),
@@ -2412,7 +2440,9 @@ app.get('/api/free-models', async (req, res) => {
                 name: 'Hugging Face Inference',
                 kind: 'hosted',
                 configured: Boolean(huggingFaceToken),
-                reachable: Boolean(huggingFaceToken),
+                reachable: HUGGINGFACE_MODELS.some(id => getModelHealth('Hugging Face', id, 'not_tested').ok),
+                pricingNote: 'Open models are listed here. Hosted inference depends on provider availability and account quota; a token is required for this app.',
+                docsUrl: 'https://huggingface.co/docs/inference-providers/pricing',
                 models: HUGGINGFACE_MODELS.map(id => ({
                     id,
                     name: cleanText(id.split('/').pop()),
@@ -2529,9 +2559,12 @@ app.post('/api/portal-scrape-sources', async (req, res) => {
         const existingNews = (cache.dashboardData || []).filter(item => item.type !== 'job');
         const seen = new Set();
         const mergedJobs = [...freshJobs, ...existingJobs].filter(job => {
-            const key = canonicalSourceUrl(job.url) || `${job.title}:${job.company}`;
-            if (seen.has(key)) return false;
+            const canonical = canonicalSourceUrl(job.url);
+            const fingerprint = jobFingerprint(job);
+            const key = canonical || fingerprint;
+            if (seen.has(key) || (fingerprint !== '||' && seen.has(fingerprint))) return false;
             seen.add(key);
+            if (fingerprint !== '||') seen.add(fingerprint);
             return true;
         }).sort((a, b) => getTimestamp(b.publishedAt || b.sourcePublishedAt) - getTimestamp(a.publishedAt || a.sourcePublishedAt)).slice(0, 500);
         cache.dashboardData = [...mergedJobs, ...existingNews].sort((a, b) => (b.collectedAt || 0) - (a.collectedAt || 0));
