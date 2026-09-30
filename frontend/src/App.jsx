@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  ArrowRight,
   ArrowUpRight,
   Bot,
   Briefcase,
