@@ -951,8 +951,8 @@ export default function App() {
         </div>
         <nav className="desk-nav" aria-label="Workspace">
           <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}><Globe2 size={15} /> World</button>
-          <button onClick={async () => { await openPortal(); setPortalTab('models'); }}><Cpu size={15} /> Free models</button>
-          <button onClick={openPortal}><Briefcase size={15} /> Career desk</button>
+          <button onClick={() => { setPortalTab('models'); void openPortal(); }}><Cpu size={15} /> Free models</button>
+          <button onClick={() => { setPortalTab('inbox'); void openPortal(); }}><Briefcase size={15} /> Career desk</button>
         </nav>
         
         <div className="topbar-actions">
