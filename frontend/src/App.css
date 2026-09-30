@@ -549,6 +549,32 @@ main {
   font-weight: 850;
 }
 
+.world-time-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-nested);
+}
+
+.world-time-filter > span { margin-right: 3px; color: var(--text-secondary); font-size: 12px; font-weight: 800; }
+.world-time-filter button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+}
+.world-time-filter button.active { border-color: #1457d9; background: #eef4ff; color: #1849a9; }
+.world-time-filter small { margin-left: auto; color: var(--text-tertiary); font-size: 11px; }
+
 .mission-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1383,6 +1409,42 @@ main {
   opacity: 0.55;
 }
 
+.career-workflow {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(300px, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  margin: 13px 0 16px;
+  padding: 13px 15px;
+  border: 1px solid #c7d7fe;
+  border-radius: 9px;
+  background: linear-gradient(110deg, #f5f8ff, #f7fbf9);
+}
+.career-workflow-copy { display: grid; gap: 4px; min-width: 0; }
+.career-workflow-copy > strong { color: var(--text-primary); font-size: 13px; }
+.career-workflow-copy > small { color: var(--text-tertiary); font-size: 11px; line-height: 1.4; }
+.career-workflow-steps { display: flex; flex-wrap: wrap; gap: 6px; }
+.career-workflow-steps button,
+.career-workflow-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 33px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.career-workflow-steps button.active { border-color: #1457d9; color: #1849a9; background: #eef4ff; }
+.career-workflow-refresh { border-color: #1457d9; background: #1457d9; color: white; }
+.career-workflow-refresh:disabled { cursor: wait; opacity: .6; }
+
 .model-probe-summary {
   display: flex;
   align-items: center;
@@ -1397,6 +1459,27 @@ main {
 
 .model-probe-summary strong { color: #067647; }
 .model-probe-summary small { margin-left: auto; }
+
+.model-catalog-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 200px minmax(220px, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-nested);
+}
+.model-catalog-controls .search-box { min-height: 38px; }
+.model-catalog-controls select {
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 7px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+}
+.model-catalog-controls > span { color: var(--text-tertiary); font-size: 11px; line-height: 1.4; }
 
 .provider-grid {
   display: grid;
@@ -1531,6 +1614,21 @@ main {
   font-weight: 800;
   text-align: right;
 }
+.model-route-actions { display: flex !important; align-items: center; gap: 7px !important; }
+.model-route-actions button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.model-empty { grid-column: 1 / -1; margin: 4px; color: var(--text-tertiary); font-size: 12px; }
+.provider-docs { display: inline-flex; align-items: center; gap: 5px; margin-top: 10px; color: #1457d9; font-size: 11px; font-weight: 750; text-decoration: none; }
+.provider-docs:hover { text-decoration: underline; }
 
 .source-studio {
   display: grid;
@@ -2148,6 +2246,11 @@ main {
     grid-template-columns: 1fr;
   }
 
+  .career-workflow { grid-template-columns: 1fr; }
+  .career-workflow-refresh { justify-self: start; }
+  .model-catalog-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .model-catalog-controls > span { grid-column: 1 / -1; }
+
   .globe-stage {
     min-height: 520px;
   }
@@ -2190,6 +2293,9 @@ main {
   .model-mode-select {
     width: 100%;
   }
+
+  .model-catalog-controls { grid-template-columns: 1fr; }
+  .model-catalog-controls > span { grid-column: auto; }
 
   .feed-row {
     grid-template-columns: 28px minmax(0, 1fr);
@@ -2243,6 +2349,8 @@ main {
   .world-scoreboard {
     justify-content: flex-start;
   }
+
+  .world-time-filter small { width: 100%; margin-left: 0; }
 
   .mission-grid,
   .lane-grid {
