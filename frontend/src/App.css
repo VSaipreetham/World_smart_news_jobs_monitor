@@ -300,6 +300,33 @@ main {
   max-width: 100%;
 }
 
+.globe-fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 22px;
+  padding: 34px 34px 220px;
+  overflow: auto;
+  background:
+    radial-gradient(ellipse at 78% 25%, rgba(39, 110, 96, .34), transparent 32%),
+    radial-gradient(ellipse at 23% 80%, rgba(20, 87, 217, .25), transparent 40%),
+    linear-gradient(145deg, #101c2c, #070b14 75%);
+  color: #f2f4f7;
+}
+.globe-fallback > div:first-child { max-width: 680px; }
+.globe-fallback > div:first-child > span { display: inline-flex; align-items: center; gap: 7px; color: #75e0bf; font-size: 11px; font-weight: 900; letter-spacing: .1em; }
+.globe-fallback h2 { margin: 12px 0 8px; color: #fff; font-size: clamp(24px, 3.5vw, 38px); line-height: 1.1; }
+.globe-fallback p { max-width: 560px; margin: 0; color: #bac6d4; font-size: 14px; line-height: 1.6; }
+.globe-fallback > div:first-child > strong { display: block; margin-top: 17px; color: #e2f5ef; font-size: 13px; }
+.globe-fallback-regions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.globe-fallback-regions button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 8px; align-items: center; min-height: 57px; padding: 10px 12px; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(255,255,255,.06); color: #f2f4f7; cursor: pointer; text-align: left; }
+.globe-fallback-regions button:hover { border-color: #75e0bf; background: rgba(117,224,191,.1); }
+.globe-fallback-regions button span { font-size: 12px; font-weight: 850; }
+.globe-fallback-regions button small { grid-column: 1; color: #aab8c8; font-size: 10px; }
+.globe-fallback-regions button svg { grid-column: 2; grid-row: 1 / 3; color: #75e0bf; }
+
 .globe-intel {
   position: absolute;
   left: 16px;
@@ -2326,6 +2353,9 @@ main {
   .globe-stage {
     min-height: 420px;
   }
+
+  .globe-fallback { justify-content: flex-start; gap: 15px; padding: 24px 16px 195px; }
+  .globe-fallback-regions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .globe-intel {
     left: 10px;
