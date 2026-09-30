@@ -11,11 +11,11 @@ import {
   Clock3,
   Cloud,
   Compass,
+  Copy,
   Cpu,
   Database,
   ExternalLink,
   Filter,
-  FileText,
   Globe2,
   Layers,
   MapPin,
@@ -1594,9 +1594,9 @@ export default function App() {
                       <div className="model-list model-route-list">
                         {visibleModels.map((model) => (
                           <div className="model-route-row" key={model.id}>
-                            <i className={model.health?.ok || model.installed ? 'ready' : ''} aria-hidden="true" />
+                            <i className={model.health?.ok || (provider.id === 'ollama' && model.installed) ? 'ready' : ''} aria-hidden="true" />
                             <span><strong>{model.name || cleanModelLabel(model.id)}</strong><small>{model.purpose || `${model.deployment || 'hosted'} response engine`}</small></span>
-                            <span className="model-route-actions"><em>{modelStatusLabel(model.health?.status || (model.installed ? 'installed · not tested' : 'not tested'))}</em><button onClick={() => copyModelId(model.id)} title={`Copy ${model.id}`} aria-label={`Copy model identifier ${model.id}`}>{copiedModel === model.id ? <Check size={14} /> : <FileText size={14} />}</button></span>
+                            <span className="model-route-actions"><em>{modelStatusLabel(model.health?.status || (model.installed && provider.id === 'ollama' ? 'installed' : 'not_tested'))}</em><button onClick={() => copyModelId(model.id)} title={`Copy ${model.id}`} aria-label={`Copy model identifier ${model.id}`}>{copiedModel === model.id ? <Check size={14} /> : <Copy size={14} />}</button></span>
                           </div>
                         ))}
                         {!visibleModels.length && <p className="model-empty">No models match this search.</p>}
