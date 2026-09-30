@@ -1,6 +1,6 @@
 const fs = require('fs/promises');
 const path = require('path');
-const { scrapeLinkedInArticlesViaGoogle, getLinkedInProxyStatus } = require('./linkedinScraper');
+const { getLinkedInProxyStatus } = require('./linkedinScraper');
 
 const DEFAULT_ROOT = path.resolve(__dirname, '../smart_job_portal/daily_news_updater');
 const root = path.resolve(process.env.DAILY_NEWS_UPDATER_PATH || DEFAULT_ROOT);
@@ -39,29 +39,6 @@ async function getLinkedInImports() {
             integration: 'DailyNewsUpdate',
         })) : [];
 
-    let proxyItems = [];
-    try {
-        const proxyRaw = await scrapeLinkedInArticlesViaGoogle();
-        proxyItems = proxyRaw.map(item => ({
-            headline: item.title,
-            source: item.source,
-            url: item.url,
-            category: item.category,
-            snippet: item.snippet,
-            date: item.publishedAt,
-            integration: item.integration
-        }));
-    } catch (e) {
-        console.error("LinkedIn Proxy scrape failed in bridge:", e.message);
-    }
-    
-    const seenUrls = new Set(parsedItems.map(i => i.url));
-    for (const item of proxyItems) {
-        if (!seenUrls.has(item.url)) {
-            parsedItems.push(item);
-        }
-    }
-    
     return parsedItems;
 }
 
